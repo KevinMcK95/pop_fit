@@ -126,8 +126,16 @@ def compute_membership_probs(trace, y_obs, pos_obs, S_obs, log_prior_ws,
     With HST Group B (appended as last element in all cases):
       + p_dwarf_hst_b_final : (N_B,) median P(dwarf) for Group B stars
     """
-    rng     = np.random.default_rng(seed)
-    stacked = trace.posterior.stack(sample=("chain", "draw"))
+    rng      = np.random.default_rng(seed)
+    # trace.posterior may be an xr.Dataset (old ArviZ) or xr.DataTree node
+    # (new ArviZ).  Extract the plain Dataset so stack/indexing behaves
+    # identically across versions.
+    _post = trace.posterior
+    if hasattr(_post, 'ds'):          # DataTree node → get root Dataset
+        _post = _post.ds
+    elif not hasattr(_post, 'dims'):  # fallback: try to_dataset()
+        _post = _post.to_dataset()
+    stacked = _post.stack(sample=("chain", "draw"))
     n_total = stacked.sizes["sample"]
     idxs    = np.sort(rng.choice(n_total, size=min(n_samples, n_total), replace=False))
     n_draws = len(idxs)

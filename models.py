@@ -228,12 +228,19 @@ def _merge_prior_into_trace(trace, prior_samples):
     try:
         trace.extend(prior_samples)
     except AttributeError:
-        # trace is xarray.DataTree with no extend(); copy groups manually
-        for group in getattr(prior_samples, 'groups', []):
-            try:
-                trace[group] = prior_samples[group]
-            except Exception:
-                pass
+        # trace is xarray.DataTree with no extend(); copy groups manually.
+        # In some ArviZ versions .groups is a callable method, not a property.
+        try:
+            groups = prior_samples.groups
+            if callable(groups):
+                groups = groups()
+            for group in groups:
+                try:
+                    trace[group] = prior_samples[group]
+                except Exception:
+                    pass
+        except Exception:
+            pass  # prior diagnostics unavailable; run continues normally
 
 
 def run_spatial_model(model, draws=1000, tune=100, chains=4, seed=42):
@@ -258,10 +265,19 @@ def run_spatial_model(model, draws=1000, tune=100, chains=4, seed=42):
     return trace
 
 
+def _get_posterior_ds(trace):
+    """Return trace.posterior as a plain xr.Dataset for both InferenceData and DataTree."""
+    post = trace.posterior
+    if hasattr(post, 'ds'):      # xarray DataTree node
+        return post.ds
+    return post                  # already an xr.Dataset (old ArviZ)
+
+
 def extract_spatial_posterior(trace):
     """Return posterior medians and 1-sigma half-widths for the spatial model."""
+    _post = _get_posterior_ds(trace)
     def _med_err(var):
-        vals = np.array(trace.posterior[var])
+        vals = np.array(_post[var])
         med = np.nanmedian(vals)
         err = 0.5 * np.diff(np.nanpercentile(vals, [16, 84]))[0]
         return float(med), float(err)
@@ -833,8 +849,9 @@ def run_gmm_model(model, draws=2000, tune=2000, chains=4, seed=42):
 
 def extract_gmm_posterior(trace):
     """Return posterior medians and errors for the spatial parameters in the GMM."""
+    _post = _get_posterior_ds(trace)
     def _med_err(var):
-        vals = np.array(trace.posterior[var])
+        vals = np.array(_post[var])
         med  = float(np.nanmedian(vals))
         err  = float(0.5 * np.diff(np.nanpercentile(vals, [16, 84]))[0])
         return med, err

@@ -324,9 +324,19 @@ def _save_run_outputs(trace, priors, pm_labels, kin,
     run_metadata.json                  – G_ref, center priors, labels, timestamp
     photometry_kde_training.npz        – G/BP/RP training photometry for KDE
     """
-    post = trace.posterior
-    prior = getattr(trace, 'prior', None)
-    pri_avail = set(prior.data_vars) if prior is not None else set()
+    # Robustly extract posterior and prior as plain xr.Datasets regardless of
+    # whether trace is an ArviZ InferenceData or newer xarray DataTree.
+    _post_raw = trace.posterior
+    post = _post_raw.ds if hasattr(_post_raw, 'ds') else _post_raw
+    try:
+        _prior_raw = trace.prior
+        prior = _prior_raw.ds if hasattr(_prior_raw, 'ds') else _prior_raw
+    except AttributeError:
+        prior = None
+    try:
+        pri_avail = set(prior.data_vars) if prior is not None else set()
+    except Exception:
+        pri_avail = set()
 
     def _flat(group, var):
         arr = np.array(group[var])
@@ -518,7 +528,13 @@ def _save_run_outputs(trace, priors, pm_labels, kin,
     print(f'  Parameter summary → {csv_path}')
 
     # run_metadata.json — G_ref + other scalar context
-    gmags_const = np.array(trace.constant_data['gmags_obs'])
+    # trace.constant_data may be a DataTree node; use item access for safety.
+    try:
+        _cdata = trace['constant_data']
+        _cdata = _cdata.ds if hasattr(_cdata, 'ds') else _cdata
+        gmags_const = np.array(_cdata['gmags_obs'])
+    except Exception:
+        gmags_const = np.array([])
     G_ref = float(np.nanmedian(gmags_const))
     meta = {
         'G_ref':            G_ref,
@@ -1542,11 +1558,14 @@ def main():
         return
 
     # Print posterior PM summary
+    _post9 = gmm_trace.posterior
+    if hasattr(_post9, 'ds'):
+        _post9 = _post9.ds
     mu_d_post = np.nanmedian(
-        np.array(gmm_trace.posterior['mu_dwarf']).reshape(-1, 3), axis=0
+        np.array(_post9['mu_dwarf']).reshape(-1, 3), axis=0
     )
     mu_d_cov  = np.cov(
-        np.array(gmm_trace.posterior['mu_dwarf']).reshape(-1, 3), rowvar=False
+        np.array(_post9['mu_dwarf']).reshape(-1, 3), rowvar=False
     )
     mu_d_err  = np.sqrt(np.diag(mu_d_cov))
     lbl0, lbl1 = pm_labels
