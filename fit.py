@@ -12,10 +12,19 @@ The script writes all output (trace + PNG plots) to:
     ./gal_fitting_results/<field>/
 """
 
+# XLA/JAX environment flags must be set before any JAX import.
+# On Linux CPU, JAX exposes only 1 device by default; numpyro needs one device
+# per chain to run chains in parallel.  XLA_FLAGS can be overridden by the
+# caller's environment (setdefault leaves an existing value alone).
+import os
+os.environ.setdefault(
+    "XLA_FLAGS",
+    "--xla_force_host_platform_device_count=4",
+)
+
 import argparse
 import csv
 import json
-import os
 import sys
 import numpy as np
 import xarray as xr

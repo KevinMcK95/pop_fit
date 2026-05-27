@@ -15,12 +15,30 @@ _B1 = 1.678
 
 
 def _setup_jax_cache():
-    """Enable JAX persistent compilation cache in ~/.cache/pop_fit_jax."""
+    """Enable JAX persistent compilation cache and report device count.
+
+    The compilation cache means the second run of an identical model skips
+    the 5–15 min XLA compile step.  On Linux CPU, JAX exposes only 1 device
+    by default; fit.py sets XLA_FLAGS before any JAX import to raise this to
+    match --chains so numpyro can run chains in parallel.
+    """
     try:
         import jax
         cache_dir = os.path.expanduser("~/.cache/pop_fit_jax")
         os.makedirs(cache_dir, exist_ok=True)
-        jax.config.update("jax_compilation_cache_dir", cache_dir)
+        # Try newer JAX API first (JAX >= 0.4.1), then fall back to old key.
+        try:
+            jax.config.update("jax_compilation_cache_dir", cache_dir)
+        except Exception:
+            try:
+                from jax.experimental.compilation_cache import compilation_cache as cc
+                cc.set_cache_dir(cache_dir)
+            except Exception:
+                pass
+        devices = jax.local_devices()
+        print(f'  JAX: {len(devices)} device(s) available '
+              f'({devices[0].platform.upper()}); '
+              f'compilation cache → {cache_dir}')
     except Exception:
         pass
 
