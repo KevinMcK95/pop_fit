@@ -210,7 +210,7 @@ def run_spatial_model(model, draws=1000, tune=100, chains=4, seed=42):
             target_accept=0.95,
             random_seed=seed,
         )
-        prior_samples = pm.sample_prior_predictive(samples=10000)
+        prior_samples = pm.sample_prior_predictive(draws=10000)
     trace.extend(prior_samples)
     return trace
 
@@ -778,7 +778,7 @@ def run_gmm_model(model, draws=2000, tune=2000, chains=4, seed=42):
             target_accept=0.95,
             random_seed=seed,
         )
-        prior_samples = pm.sample_prior_predictive(samples=10000)
+        prior_samples = pm.sample_prior_predictive(draws=10000)
     trace.extend(prior_samples)
     return trace
 
