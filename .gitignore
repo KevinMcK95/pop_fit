@@ -1,0 +1,24 @@
+# Pipeline outputs
+gal_fitting_results/
+
+# Large data files
+bp3m_data/
+milliquas.fits
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# JAX compilation cache
+.cache/
+
+# macOS
+.DS_Store
