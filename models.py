@@ -198,6 +198,26 @@ def build_spatial_model(pos_obs, log_prior_ws, survey_area,
     return model
 
 
+def _merge_prior_into_trace(trace, prior_samples):
+    """Merge prior predictive samples into trace across old/new PyMC/ArviZ APIs.
+
+    Handles three environments:
+    - New ArviZ (idata= path, already done before calling this)
+    - Old ArviZ with InferenceData trace: trace.extend(prior_samples)
+    - Mixed: trace is xarray.DataTree, prior_samples is InferenceData
+              → copy groups via DataTree item assignment
+    """
+    try:
+        trace.extend(prior_samples)
+    except AttributeError:
+        # trace is xarray.DataTree with no extend(); copy groups manually
+        for group in getattr(prior_samples, 'groups', []):
+            try:
+                trace[group] = prior_samples[group]
+            except Exception:
+                pass
+
+
 def run_spatial_model(model, draws=1000, tune=100, chains=4, seed=42):
     """Sample the spatial model and return the trace (with prior predictive)."""
     _setup_jax_cache()
@@ -211,12 +231,12 @@ def run_spatial_model(model, draws=1000, tune=100, chains=4, seed=42):
             random_seed=seed,
         )
         try:
-            # PyMC 5 / ArviZ 0.18+: idata= adds prior in-place (DataTree API)
+            # PyMC 5 / ArviZ 0.18+: idata= adds prior in-place
             pm.sample_prior_predictive(draws=10000, idata=trace)
         except TypeError:
-            # Older PyMC: idata kwarg not supported; extend manually
+            # Older PyMC: idata kwarg not supported; merge manually
             prior_samples = pm.sample_prior_predictive(draws=10000)
-            trace.extend(prior_samples)
+            _merge_prior_into_trace(trace, prior_samples)
     return trace
 
 
@@ -784,12 +804,12 @@ def run_gmm_model(model, draws=2000, tune=2000, chains=4, seed=42):
             random_seed=seed,
         )
         try:
-            # PyMC 5 / ArviZ 0.18+: idata= adds prior in-place (DataTree API)
+            # PyMC 5 / ArviZ 0.18+: idata= adds prior in-place
             pm.sample_prior_predictive(draws=10000, idata=trace)
         except TypeError:
-            # Older PyMC: idata kwarg not supported; extend manually
+            # Older PyMC: idata kwarg not supported; merge manually
             prior_samples = pm.sample_prior_predictive(draws=10000)
-            trace.extend(prior_samples)
+            _merge_prior_into_trace(trace, prior_samples)
     return trace
 
 
