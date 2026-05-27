@@ -1498,7 +1498,12 @@ def main():
         _const['y_obs_qso']  = y_obs_qso
         _const['S_obs_qso']  = S_obs_qso
         _const['gmags_qso']  = gmags_qso
-    gmm_trace.add_groups({'constant_data': _arrays_to_dataset(_const)})
+    _const_ds = _arrays_to_dataset(_const)
+    try:
+        gmm_trace.add_groups({'constant_data': _const_ds})
+    except AttributeError:
+        # Newer ArviZ returns xarray.DataTree which uses item assignment
+        gmm_trace['constant_data'] = _const_ds
 
     trace_path = os.path.join(result_path, f'{field}_trace.nc')
     gmm_trace.to_netcdf(trace_path)
