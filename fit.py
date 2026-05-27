@@ -22,6 +22,15 @@ os.environ.setdefault(
     "--xla_force_host_platform_device_count=4",
 )
 
+# JAX/XLA compilation runs in C++ threads that ignore Python's KeyboardInterrupt.
+# Install a SIGINT handler that calls os._exit() to force an immediate OS-level
+# exit, which terminates C threads too — making Ctrl+C work reliably.
+import signal
+def _sigint_handler(sig, frame):
+    print('\nInterrupted — exiting.', flush=True)
+    os._exit(1)
+signal.signal(signal.SIGINT, _sigint_handler)
+
 import argparse
 import csv
 import json
