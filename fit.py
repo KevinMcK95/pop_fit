@@ -14,12 +14,15 @@ The script writes all output (trace + PNG plots) to:
 
 # XLA/JAX environment flags must be set before any JAX import.
 # On Linux CPU, JAX exposes only 1 device by default; numpyro needs one device
-# per chain to run chains in parallel.  XLA_FLAGS can be overridden by the
-# caller's environment (setdefault leaves an existing value alone).
+# per chain to run chains in parallel.
+# The device count defaults to 4 but can be overridden via POP_FIT_N_DEVICES
+# or XLA_FLAGS in the caller's environment, e.g.:
+#   POP_FIT_N_DEVICES=16 python fit.py Leo_I --chains 16
 import os
+_n_devices = os.environ.get("POP_FIT_N_DEVICES", "4")
 os.environ.setdefault(
     "XLA_FLAGS",
-    "--xla_force_host_platform_device_count=4",
+    f"--xla_force_host_platform_device_count={_n_devices}",
 )
 
 # JAX/XLA compilation runs in C++ threads that ignore Python's KeyboardInterrupt.
