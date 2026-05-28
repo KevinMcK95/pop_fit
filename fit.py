@@ -896,11 +896,9 @@ def main():
         spatial_profile_ft = _spatial_profile_saved
         args.spatial_profile = spatial_profile_ft  # propagate into membership call
 
-        # Extract GMM posterior summary (sp dict): centre, shape, PA.
-        gmm_sp = extract_gmm_posterior(gmm_trace)
-        sp = gmm_sp
-
         # Retrieve constant_data (may be DataTree node or plain Dataset).
+        # sp / r_ell_updated / clean_sample / prior_log_probs are produced by
+        # steps 5–6 which still run; only step 7 (GMM MCMC) is skipped.
         _cdt_raw = gmm_trace['constant_data']
         _cdt = _cdt_raw.ds if hasattr(_cdt_raw, 'ds') else _cdt_raw
 
@@ -1006,20 +1004,6 @@ def main():
                 'n_hst_used':     _hst_b_nhst  if _hst_b_nhst  is not None else np.zeros(len(_hst_b_gaia_id)),
             })
 
-        # Reconstruct r_ell_updated and morphology priors needed for step 8.
-        r_ell_updated = compute_elliptical_r(
-            kin['radec_offsets'],
-            sp['new_delta_ra_center'], sp['new_delta_dec_center'],
-            sp['new_pa_deg'], sp['new_ellipticity'],
-            scale_deg=priors['rhalf_mean'] / 60.0,
-        )
-        original_radec_center   = priors['radec_center'].copy()
-        original_spatial_priors = {k: priors[k]
-                                   for k in ('pa_mean', 'ellipticity_mean', 'rhalf_mean')}
-        clean_sample     = None   # skip photometry_kde_training.npz in _save_run_outputs
-        clean_background = None
-        prior_log_probs  = None   # not needed after good_to_keep loaded from constant_data
-
         n_gmm = len(y_obs) if y_obs is not None else 0
         print(f'  Restored: {n_gmm:,} GMM stars, '
               f'survey area = {gmm_survey_area:.5f} deg²')
@@ -1032,15 +1016,14 @@ def main():
         if is_hst_main_gmm is not None:
             print(f'  HST/BP3M active ({is_hst_main_gmm.sum():,} Group A, '
                   f'{len(y_obs_hst_b_gmm) if y_obs_hst_b_gmm is not None else 0:,} Group B)')
+        print('  Steps 5–6 will re-run to get the refined spatial model and photometric prior.')
 
-    # ── 5–7. Spatial model, photometric prior, GMM (skipped with --from-trace) ──
-    # In --from-trace mode the trace is already loaded and all variables are set
-    # above; raise _SkipToStep8 to jump past the MCMC steps.
+    # ── 5–7. Spatial model, photometric prior, GMM (step 7 skipped with --from-trace) ──
+    # Steps 5 and 6 are fast and refine the spatial model / photometric prior used
+    # in membership; only step 7 (GMM MCMC) is expensive and skipped via --from-trace.
     class _SkipToStep8(Exception):
         pass
     try:
-        if args.from_trace:
-            raise _SkipToStep8()
 
         # ── 5. Spatial model (optionally iterated) ────────────────────────
 
@@ -1316,6 +1299,8 @@ def main():
             return
 
         # ── 7. Prepare GMM data and run ───────────────────────────────────────
+        if args.from_trace:
+            raise _SkipToStep8()
         print('\n[7/9] Running full GMM...')
         GMM_MAX_R_ELL = 7.0   # selection radius in units of rhalf
         (keep_inds, pos_obs, y_obs, S_obs,
