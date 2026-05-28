@@ -93,9 +93,11 @@ def parse_args():
     g.add_argument('--sampler', default='numpyro', choices=['numpyro', 'nutpie'],
                    help='NUTS backend: numpyro (JAX, default) or nutpie (Rust/PyTensor, '
                         'better CPU parallelism on many-core servers). (default numpyro)')
-    g.add_argument('--sampler-threads', type=int, default=8,
-                   help='Threads per chain for nutpie (default 8; with --chains 4 this '
-                        'uses 32 cores total). No effect with numpyro.')
+    _default_threads = min(8, os.cpu_count() or 8)
+    g.add_argument('--sampler-threads', type=int, default=_default_threads,
+                   help=f'Threads per chain for nutpie (default min(8, cpu_count) = '
+                        f'{_default_threads} on this machine; with --chains 4 this uses '
+                        f'{4 * _default_threads} cores total). No effect with numpyro.')
 
     s = p.add_argument_group('MCMC — spatial model')
     s.add_argument('--spatial-draws', type=int, default=1000,
