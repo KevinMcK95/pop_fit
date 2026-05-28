@@ -443,34 +443,6 @@ def plot_background_gmm(pm_and_paras, good_backgrounds,
 # ArviZ diagnostic plots per component
 # ---------------------------------------------------------------------------
 
-def _az_plot_posterior(trace, var_names):
-    """Call plot_posterior, handling its move to arviz_plots in newer ArviZ."""
-    try:
-        az.plot_posterior(trace, var_names=var_names)
-        return
-    except AttributeError:
-        pass
-    try:
-        import arviz_plots as azp
-        azp.plot_posterior(trace, var_names=var_names)
-    except Exception:
-        raise
-
-
-def _az_plot_dist_comparison(trace, var_names):
-    """Call plot_dist_comparison, handling its move to arviz_plots in newer ArviZ."""
-    try:
-        az.plot_dist_comparison(trace, var_names=var_names)
-        return
-    except AttributeError:
-        pass
-    try:
-        import arviz_plots as azp
-        azp.plot_dist_comparison(trace, var_names=var_names)
-    except Exception:
-        raise
-
-
 def plot_arviz_diagnostics(trace, var_names, component_name, field, result_path):
     """
     Corner (pair), trace, posterior, and prior/posterior comparison plots
@@ -478,6 +450,8 @@ def plot_arviz_diagnostics(trace, var_names, component_name, field, result_path)
     skipped so old traces and new traces both work.  Each plot is wrapped in
     try/except so an API change in one ArviZ version cannot crash the pipeline.
     """
+    import arviz_plots as azp
+
     _post = trace.posterior
     if hasattr(_post, 'ds'):
         _post = _post.ds
@@ -488,17 +462,11 @@ def plot_arviz_diagnostics(trace, var_names, component_name, field, result_path)
     prefix = os.path.join(result_path, f'{field}')
 
     def _save(path):
-        plt.tight_layout()
-        plt.savefig(path, dpi=100)
-        plt.close()
+        plt.savefig(path, dpi=100, bbox_inches='tight')
+        plt.close('all')
 
     try:
-        # Raise the subplot cap so large corner plots aren't silently dropped.
-        old_max = matplotlib.rcParams.get('plot.max_subplots', 40)
-        matplotlib.rcParams['plot.max_subplots'] = max(old_max,
-                                                        len(var_names) ** 2 + 1)
         az.plot_pair(trace, var_names=var_names)
-        matplotlib.rcParams['plot.max_subplots'] = old_max
         _save(f'{prefix}_corner_{component_name}.png')
     except Exception as e:
         plt.close('all')
@@ -512,18 +480,18 @@ def plot_arviz_diagnostics(trace, var_names, component_name, field, result_path)
         print(f'  WARNING: plot_trace failed for {component_name}: {e}')
 
     try:
-        _az_plot_posterior(trace, var_names)
+        azp.plot_trace_dist(trace, var_names=var_names)
         _save(f'{prefix}_posterior_{component_name}.png')
     except Exception as e:
         plt.close('all')
-        print(f'  WARNING: plot_posterior failed for {component_name}: {e}')
+        print(f'  WARNING: plot_trace_dist failed for {component_name}: {e}')
 
     try:
-        _az_plot_dist_comparison(trace, var_names)
+        azp.plot_prior_posterior(trace, var_names=var_names)
         _save(f'{prefix}_prior_comp_posterior_{component_name}.png')
     except Exception as e:
         plt.close('all')
-        print(f'  WARNING: plot_dist_comparison failed for {component_name}: {e}')
+        print(f'  WARNING: plot_prior_posterior failed for {component_name}: {e}')
 
     print(f'  Saved ArviZ diagnostics for {component_name}')
 
