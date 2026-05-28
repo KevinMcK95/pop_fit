@@ -13,25 +13,35 @@ The script writes all output (trace + PNG plots) to:
 """
 
 # XLA/JAX environment flags must be set before any JAX import.
-# On Linux CPU, JAX exposes only 1 device by default; numpyro needs one device
-# per chain to run chains in parallel.
-# The device count defaults to 4 but can be overridden via POP_FIT_N_DEVICES
-# or XLA_FLAGS in the caller's environment, e.g.:
-#   POP_FIT_N_DEVICES=16 python fit.py Leo_I --chains 16
+# chain_method="vectorized" uses vmap (not pmap) so only 1 virtual device is needed.
+# --xla_cpu_intra_op_parallelism_threads caps XLA's per-op thread count; on many-core
+# machines the default (all cores) causes severe overhead for the small 3x3 matrices
+# in NUTS. POP_FIT_N_THREADS defaults to 4; POP_FIT_N_DEVICES is kept for testing.
 import os
-_n_devices = os.environ.get("POP_FIT_N_DEVICES", "4")
+_n_devices = os.environ.get("POP_FIT_N_DEVICES", "1")
+_n_threads  = os.environ.get("POP_FIT_N_THREADS", "4")
 os.environ.setdefault(
     "XLA_FLAGS",
-    f"--xla_force_host_platform_device_count={_n_devices}",
+    f"--xla_force_host_platform_device_count={_n_devices}"
+    f" --xla_cpu_intra_op_parallelism_threads={_n_threads}",
 )
 
-# JAX/XLA compilation runs in C++ threads that ignore Python's KeyboardInterrupt.
-# Install a SIGINT handler that calls os._exit() to force an immediate OS-level
-# exit, which terminates C threads too — making Ctrl+C work reliably.
-import signal
+# Ctrl+C fix: numpyro sampling runs an entire jax.lax.scan in C++ without returning
+# to Python, so a Python signal handler is never invoked during sampling. A daemon
+# watchdog thread runs in Python and sends SIGKILL (uncatchable) when interrupted.
+import signal, threading
+_interrupt_event = threading.Event()
+
 def _sigint_handler(sig, frame):
-    print('\nInterrupted — exiting.', flush=True)
-    os._exit(1)
+    if _interrupt_event.is_set():
+        return  # already handling
+    _interrupt_event.set()
+    print('\nInterrupted — force-killing process...', flush=True)
+    def _kill():
+        import time; time.sleep(0.05)
+        os.kill(os.getpid(), signal.SIGKILL)
+    threading.Thread(target=_kill, daemon=True).start()
+
 signal.signal(signal.SIGINT, _sigint_handler)
 
 import argparse
