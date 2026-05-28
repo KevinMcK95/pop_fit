@@ -23,40 +23,48 @@ Optional extensions support incorporating HST astrometry from the [BP3M pipeline
 
 ## Installation
 
-The pipeline runs in a `conda` environment. The recommended setup uses `conda` with `mamba` for speed:
+The pipeline runs in a `conda` environment. Use `mamba` if available (faster solver); otherwise replace `mamba` with `conda` below.
 
 ```bash
-conda create -n pymc_new -c conda-forge \
+mamba create -n pymc_new -c conda-forge \
+    "python>=3.12" \
     "pymc>=5" "numpyro>=0.15" "arviz=0.23.4" nutpie \
     astropy astroquery scikit-learn "matplotlib>=3.9" \
     pandas scipy h5netcdf
 conda activate pymc_new
 ```
 
-Key version requirements:
-- **`arviz=0.23.4`**: pinned because the diagnostic plot functions `plot_posterior` and `plot_dist_comparison` were removed in arviz 1.x. The code falls back to arviz_plots equivalents if a newer version is installed, but the 0.23.x output looks significantly better.
-- **`nutpie`**: Rust-based NUTS backend. Strongly recommended on multi-core CPU servers — gives ~15× speedup over the default numpyro backend by using native threads instead of JAX virtual devices. Use with `--sampler nutpie`.
-- **`h5netcdf`**: required to save the MCMC trace to NetCDF4 format. ArviZ will attempt zarr first; if zarr ≥ 3 is installed (which nutpie requires) ArviZ cannot use it, so h5netcdf must be present as the fallback. Without it the trace cannot be written to disk and MCMC results are lost.
+Verify the install worked:
+
+```bash
+python -c "import pymc, numpyro, arviz, nutpie, h5netcdf; print('arviz:', arviz.__version__)"
+# Should print: arviz: 0.23.4
+```
+
+**Key version requirements:**
+
+| Package | Requirement | Why |
+|---------|-------------|-----|
+| `arviz=0.23.4` | exact pin | `plot_posterior` and `plot_dist_comparison` were removed in arviz 1.x; the 0.23.x figures are significantly better |
+| `nutpie` | any | Rust-based NUTS backend; ~15× faster than `numpyro` on multi-core CPU servers via native Rayon threads. nutpie requires zarr ≥ 3 (installed automatically). |
+| `h5netcdf` | required | ArviZ saves traces via zarr first; nutpie installs zarr ≥ 3 which ArviZ cannot use. `h5netcdf` must be present as the fallback — without it the trace is not written to disk and MCMC results are lost. |
+| `python>=3.12` | recommended | Avoids incompatible package combinations seen with older Python versions |
 
 ### Shell environment (Linux/server)
 
-Add the following to `~/.bashrc` (or equivalent) on any Linux server:
+Add to `~/.bashrc` on any Linux server and re-source it (`source ~/.bashrc`):
 
 ```bash
-# Limit MKL/OpenBLAS thread count for NumPy operations outside JAX.
-# Without this, MKL defaults to using all available cores per BLAS call,
-# which causes severe overhead for the small matrix operations in NUTS.
+# Limit MKL/BLAS thread count for NumPy operations.
+# Without this, MKL defaults to using all CPU cores per BLAS call,
+# causing severe thread-spawn overhead for the small matrices in NUTS.
 export OMP_NUM_THREADS=8
 export MKL_NUM_THREADS=8
 ```
 
-These variables affect NumPy/SciPy operations (background GMM fitting, membership
-post-processing, etc.) but not JAX's internal threading. For JAX, use `--sampler nutpie`
-instead — nutpie's Rayon thread pool is controlled by `--sampler-threads` (default
-`min(8, cpu_count)`, so 32 cores total with 4 chains).
+These apply to NumPy/SciPy operations outside JAX (background GMM, membership post-processing). For the MCMC sampler itself, use `--sampler nutpie` — its Rayon thread pool is set by `--sampler-threads` (default `min(8, cpu_count)`, giving 32 cores with 4 chains).
 
-Do **not** set `XLA_FLAGS` or `POP_FIT_N_DEVICES` manually — the code sets these
-automatically.
+Do **not** set `XLA_FLAGS` or `POP_FIT_N_DEVICES` manually — the code manages these.
 
 Then clone this repository:
 
