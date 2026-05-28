@@ -3,6 +3,11 @@
 Translates `orig_code/PM_pop_fit_with_density_test.ipynb` into a modular CLI
 pipeline.  Run with the `pymc_new` conda environment.
 
+**Required ArviZ version: `arviz=0.23.4`.**  The diagnostic plot functions `plot_posterior` and `plot_dist_comparison` were removed in arviz 1.x.  The code falls back to `arviz_plots` equivalents automatically on newer installs, but the 0.23.4 output looks significantly better.  Install with:
+```bash
+conda install -n pymc_new -c conda-forge arviz=0.23.4
+```
+
 ## Quick start
 
 ```bash
@@ -20,6 +25,11 @@ conda run -n pymc_new python fit.py NGC_55 \
     --draws 50 --tune 50 --chains 2 \
     --spatial-draws 100 --spatial-tune 50 \
     --n-member-samples 100
+
+# Re-run plots and membership from a saved trace (skips step 7 GMM only;
+# steps 5–6 still re-run to get the correct refined spatial model and prior)
+conda run -n pymc_new python fit.py NGC_55 --from-trace
+conda run -n pymc_new python fit.py Leo_I --bp3m-dir ./data/ --from-trace
 
 # Run with BP3M HST astrometry (Group A substitution + Group B faint stars)
 conda run -n pymc_new python fit.py Leo_I \
@@ -64,6 +74,8 @@ All outputs (plots + trace NetCDF) go to `./gal_fitting_results/<field>/`.
 
 Use `--stop-after N` to halt after step N (1–9).
 
+`--from-trace` skips only step 7 (GMM MCMC). Steps 1–6 always re-run so that membership probabilities in steps 8–9 use the same refined spatial model and photometric prior that were used in the original run, not the initial step-4 estimates.
+
 ## Key CLI flags
 
 | Flag | Default | Description |
@@ -74,6 +86,7 @@ Use `--stop-after N` to halt after step N (1–9).
 | `--spatial-draws` | 1000 | Spatial model draws |
 | `--spatial-tune` | 100 | Spatial model tuning steps |
 | `--stop-after` | 9 | Stop after step N |
+| `--from-trace` | off | Skip step 7 (GMM MCMC) and load the saved `{field}_trace.nc` instead. Steps 1–6 still re-run. Restores `pm_labels` and `spatial_profile` from `run_metadata.json`. Backward compatible: traces saved before `keep_inds` was added to `constant_data` are handled via cKDTree nearest-neighbour reconstruction. |
 | `--binned-prior` | off | Use binned colour profiles instead of 3-D KDE in (G, BP, RP) space (KDE is default) |
 | `--spatial-profile` | plummer | `plummer` or `sersic` (Sérsic n=1) |
 | `--seed` | 42 | Random seed |
