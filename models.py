@@ -243,19 +243,37 @@ def _merge_prior_into_trace(trace, prior_samples):
             pass  # prior diagnostics unavailable; run continues normally
 
 
-def run_spatial_model(model, draws=1000, tune=100, chains=4, seed=42):
-    """Sample the spatial model and return the trace (with prior predictive)."""
-    _setup_jax_cache()
-    with model:
-        trace = pm.sample(
-            nuts_sampler="numpyro",
+def _sample(model, draws, tune, chains, seed, sampler, sampler_threads):
+    """Run pm.sample with the requested NUTS backend."""
+    if sampler == 'nutpie':
+        import os
+        os.environ['RAYON_NUM_THREADS'] = str(sampler_threads)
+        return pm.sample(
+            nuts_sampler='nutpie',
             chains=chains,
             tune=tune,
             draws=draws,
             target_accept=0.95,
             random_seed=seed,
-            nuts_sampler_kwargs={"chain_method": "parallel"},
         )
+    else:
+        _setup_jax_cache()
+        return pm.sample(
+            nuts_sampler='numpyro',
+            chains=chains,
+            tune=tune,
+            draws=draws,
+            target_accept=0.95,
+            random_seed=seed,
+            nuts_sampler_kwargs={'chain_method': 'parallel'},
+        )
+
+
+def run_spatial_model(model, draws=1000, tune=100, chains=4, seed=42,
+                      sampler='numpyro', sampler_threads=8):
+    """Sample the spatial model and return the trace (with prior predictive)."""
+    with model:
+        trace = _sample(model, draws, tune, chains, seed, sampler, sampler_threads)
         try:
             # PyMC 5 / ArviZ 0.18+: idata= adds prior in-place
             pm.sample_prior_predictive(draws=10000, idata=trace)
@@ -826,19 +844,11 @@ def build_gmm_model(pos_obs, y_obs, S_obs, log_prior_ws, survey_area,
     return model
 
 
-def run_gmm_model(model, draws=2000, tune=2000, chains=4, seed=42):
+def run_gmm_model(model, draws=2000, tune=2000, chains=4, seed=42,
+                  sampler='numpyro', sampler_threads=8):
     """Sample the GMM and return the trace (with prior predictive)."""
-    _setup_jax_cache()
     with model:
-        trace = pm.sample(
-            nuts_sampler="numpyro",
-            chains=chains,
-            tune=tune,
-            draws=draws,
-            target_accept=0.95,
-            random_seed=seed,
-            nuts_sampler_kwargs={"chain_method": "parallel"},
-        )
+        trace = _sample(model, draws, tune, chains, seed, sampler, sampler_threads)
         try:
             # PyMC 5 / ArviZ 0.18+: idata= adds prior in-place
             pm.sample_prior_predictive(draws=10000, idata=trace)

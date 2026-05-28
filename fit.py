@@ -90,6 +90,12 @@ def parse_args():
     g.add_argument('--draws',  type=int, default=2000, help='Posterior draws (default 2000)')
     g.add_argument('--tune',   type=int, default=2000, help='Tuning steps   (default 2000)')
     g.add_argument('--chains', type=int, default=4,    help='MCMC chains    (default 4)')
+    g.add_argument('--sampler', default='numpyro', choices=['numpyro', 'nutpie'],
+                   help='NUTS backend: numpyro (JAX, default) or nutpie (Rust/PyTensor, '
+                        'better CPU parallelism on many-core servers). (default numpyro)')
+    g.add_argument('--sampler-threads', type=int, default=8,
+                   help='Threads per chain for nutpie (default 8; with --chains 4 this '
+                        'uses 32 cores total). No effect with numpyro.')
 
     s = p.add_argument_group('MCMC — spatial model')
     s.add_argument('--spatial-draws', type=int, default=1000,
@@ -1099,6 +1105,7 @@ def main():
                 spatial_model,
                 draws=args.spatial_draws, tune=args.spatial_tune,
                 chains=args.chains, seed=args.seed,
+                sampler=args.sampler, sampler_threads=args.sampler_threads,
             )
             sp = extract_spatial_posterior(spatial_trace)
             print(f'  Posterior a_plummer   = {sp["new_a_plummer"]:.2f} ± {sp["new_a_plummer_err"]:.2f} arcmin')
@@ -1688,6 +1695,7 @@ def main():
             gmm_model,
             draws=args.draws, tune=args.tune,
             chains=args.chains, seed=args.seed,
+            sampler=args.sampler, sampler_threads=args.sampler_threads,
         )
 
         # Compute good_to_keep for plots — needs ~is_qso_main so done here
