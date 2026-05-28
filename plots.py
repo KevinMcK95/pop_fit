@@ -478,6 +478,7 @@ def plot_arviz_diagnostics(trace, var_names, component_name, field, result_path)
     prefix = os.path.join(result_path, f'{field}')
 
     def _save(path):
+        plt.tight_layout()
         plt.savefig(path, dpi=100, bbox_inches='tight')
         plt.close('all')
 
