@@ -27,15 +27,36 @@ The pipeline runs in a `conda` environment. The recommended setup uses `conda` w
 
 ```bash
 conda create -n pymc_new -c conda-forge \
-    "pymc>=5" "numpyro>=0.15" "arviz=0.23.4" \
+    "pymc>=5" "numpyro>=0.15" "arviz=0.23.4" nutpie \
     astropy astroquery scikit-learn "matplotlib>=3.9" \
     pandas scipy h5netcdf
 conda activate pymc_new
 ```
 
 Key version requirements:
-- **`arviz=0.23.4`**: pinned because the diagnostic plot API (`plot_posterior`, `plot_dist_comparison`) was removed in arviz 1.x. The code falls back to the arviz_plots 1.1+ equivalents automatically if a newer version is installed, but the 0.23.x output looks significantly better.
+- **`arviz=0.23.4`**: pinned because the diagnostic plot functions `plot_posterior` and `plot_dist_comparison` were removed in arviz 1.x. The code falls back to arviz_plots equivalents if a newer version is installed, but the 0.23.x output looks significantly better.
+- **`nutpie`**: Rust-based NUTS backend. Strongly recommended on multi-core CPU servers — gives ~15× speedup over the default numpyro backend by using native threads instead of JAX virtual devices. Use with `--sampler nutpie`.
 - **`h5netcdf`**: required to save the MCMC trace to NetCDF4 format (which supports multiple groups). Without it the trace cannot be written to disk.
+
+### Shell environment (Linux/server)
+
+Add the following to `~/.bashrc` (or equivalent) on any Linux server:
+
+```bash
+# Limit MKL/OpenBLAS thread count for NumPy operations outside JAX.
+# Without this, MKL defaults to using all available cores per BLAS call,
+# which causes severe overhead for the small matrix operations in NUTS.
+export OMP_NUM_THREADS=8
+export MKL_NUM_THREADS=8
+```
+
+These variables affect NumPy/SciPy operations (background GMM fitting, membership
+post-processing, etc.) but not JAX's internal threading. For JAX, use `--sampler nutpie`
+instead — nutpie's Rayon thread pool is controlled by `--sampler-threads` (default
+`min(8, cpu_count)`, so 32 cores total with 4 chains).
+
+Do **not** set `XLA_FLAGS` or `POP_FIT_N_DEVICES` manually — the code sets these
+automatically.
 
 Then clone this repository:
 

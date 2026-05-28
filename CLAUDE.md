@@ -8,6 +8,17 @@ pipeline.  Run with the `pymc_new` conda environment.
 conda install -n pymc_new -c conda-forge arviz=0.23.4
 ```
 
+**Recommended on multi-core CPU servers: `--sampler nutpie`.**  The default `numpyro` backend uses JAX pmap with one thread per chain (~4 cores for 4 chains), giving poor utilisation on many-core machines.  `nutpie` uses Rust/Rayon and achieved ~15× speedup (from ~7 hours to ~30 minutes) on a 152-core Xeon.  Install with:
+```bash
+conda install -n pymc_new -c conda-forge nutpie
+```
+Then add to `~/.bashrc`:
+```bash
+export OMP_NUM_THREADS=8   # MKL/BLAS threading for NumPy ops outside JAX
+export MKL_NUM_THREADS=8
+```
+Do **not** set `XLA_FLAGS` or `POP_FIT_N_DEVICES` manually — the code sets these.
+
 ## Quick start
 
 ```bash
@@ -83,6 +94,8 @@ Use `--stop-after N` to halt after step N (1–9).
 | `--draws` | 2000 | GMM posterior draws |
 | `--tune` | 2000 | GMM tuning steps |
 | `--chains` | 4 | MCMC chains |
+| `--sampler` | `numpyro` | NUTS backend: `numpyro` (JAX, default) or `nutpie` (Rust/PyTensor). `nutpie` is strongly recommended on multi-core CPU servers. |
+| `--sampler-threads` | `min(8, cpu_count)` | Threads per chain for `nutpie`. With `--chains 4` and 8 threads this uses 32 cores. No effect with `numpyro`. |
 | `--spatial-draws` | 1000 | Spatial model draws |
 | `--spatial-tune` | 100 | Spatial model tuning steps |
 | `--stop-after` | 9 | Stop after step N |
