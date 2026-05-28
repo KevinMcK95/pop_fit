@@ -524,7 +524,7 @@ def _save_run_outputs(trace, priors, pm_labels, kin,
         'prior_median',     'prior_q16',     'prior_q84',
         'prior_q2.5',       'prior_q97.5',
     ]
-    with open(csv_path, 'w', newline='') as fh:
+    with open(csv_path, 'w', newline='', encoding='utf-8') as fh:
         writer = csv.DictWriter(fh, fieldnames=fieldnames)
         writer.writeheader()
         for row in rows:
