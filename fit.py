@@ -17,7 +17,7 @@ The script writes all output (trace + PNG plots) to:
 # XLA CPU threading is controlled by OMP_NUM_THREADS in the caller's environment
 # (set to ~4-8 on many-core servers to avoid thread-spawn overhead).
 import os
-_n_devices = os.environ.get("POP_FIT_N_DEVICES", "1")
+_n_devices = os.environ.get("POP_FIT_N_DEVICES", "4")
 os.environ.setdefault(
     "XLA_FLAGS",
     f"--xla_force_host_platform_device_count={_n_devices}",
