@@ -26,9 +26,11 @@ Optional extensions support incorporating HST astrometry from the [BP3M pipeline
 The pipeline runs in a `conda` environment. The recommended setup uses `conda` with `mamba` for speed:
 
 ```bash
-conda create -n pymc_new -c conda-forge pymc numpyro arviz astropy astroquery scikit-learn matplotlib pandas scipy
+conda create -n pymc_new -c conda-forge pymc numpyro arviz astropy astroquery scikit-learn matplotlib pandas scipy h5netcdf
 conda activate pymc_new
 ```
+
+`h5netcdf` is required to save the MCMC trace to NetCDF4 format (which supports multiple groups). Without it the trace cannot be written to disk.
 
 Then clone this repository:
 
