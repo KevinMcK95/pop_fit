@@ -254,6 +254,7 @@ def run_spatial_model(model, draws=1000, tune=100, chains=4, seed=42):
             draws=draws,
             target_accept=0.95,
             random_seed=seed,
+            nuts_sampler_kwargs={"chain_method": "vectorized"},
         )
         try:
             # PyMC 5 / ArviZ 0.18+: idata= adds prior in-place
@@ -836,6 +837,7 @@ def run_gmm_model(model, draws=2000, tune=2000, chains=4, seed=42):
             draws=draws,
             target_accept=0.95,
             random_seed=seed,
+            nuts_sampler_kwargs={"chain_method": "vectorized"},
         )
         try:
             # PyMC 5 / ArviZ 0.18+: idata= adds prior in-place
