@@ -29,7 +29,7 @@ The pipeline runs in a `conda` environment. The recommended setup uses `conda` w
 conda create -n pymc_new -c conda-forge \
     "pymc>=5" "numpyro>=0.15" "arviz=0.23.4" nutpie \
     astropy astroquery scikit-learn "matplotlib>=3.9" \
-    pandas scipy h5netcdf
+    pandas scipy h5netcdf "zarr<3"
 conda activate pymc_new
 ```
 
@@ -37,6 +37,7 @@ Key version requirements:
 - **`arviz=0.23.4`**: pinned because the diagnostic plot functions `plot_posterior` and `plot_dist_comparison` were removed in arviz 1.x. The code falls back to arviz_plots equivalents if a newer version is installed, but the 0.23.x output looks significantly better.
 - **`nutpie`**: Rust-based NUTS backend. Strongly recommended on multi-core CPU servers — gives ~15× speedup over the default numpyro backend by using native threads instead of JAX virtual devices. Use with `--sampler nutpie`.
 - **`h5netcdf`**: required to save the MCMC trace to NetCDF4 format (which supports multiple groups). Without it the trace cannot be written to disk.
+- **`zarr<3`**: zarr ≥ 3 has breaking API changes that are not supported by ArviZ. Pinning to `<3` prevents ArviZ's trace-save from failing silently and losing MCMC results.
 
 ### Shell environment (Linux/server)
 
