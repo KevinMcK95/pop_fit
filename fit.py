@@ -919,6 +919,17 @@ def main():
         bg_covs      = _cd('bg_covs')
         bg_weights   = _cd('bg_weights')
         keep_inds    = _cd('keep_inds')
+        # Backward compatibility: traces saved before this change lack keep_inds.
+        # Reconstruct by nearest-neighbour matching of pos_obs against radec_offsets.
+        if keep_inds is None and pos_obs is not None:
+            print('  keep_inds not in trace (old format) — reconstructing via '
+                  'nearest-neighbour match of pos_obs...')
+            from scipy.spatial import cKDTree
+            _kd = cKDTree(kin['radec_offsets'])
+            _, keep_inds = _kd.query(pos_obs)
+            keep_inds = np.asarray(keep_inds, dtype=int)
+            print(f'  Reconstructed keep_inds: {len(keep_inds):,} stars')
+
         _sa          = _cd('gmm_survey_area')
         gmm_survey_area = float(_sa[0]) if _sa is not None else kin['survey_area']
         _iqm = _cd('is_qso_main')
