@@ -443,6 +443,24 @@ def plot_background_gmm(pm_and_paras, good_backgrounds,
 # ArviZ diagnostic plots per component
 # ---------------------------------------------------------------------------
 
+def _az_plot_posterior(trace, var_names):
+    """plot_posterior (arviz <1.0) or plot_trace_dist (arviz_plots >=1.1)."""
+    if hasattr(az, 'plot_posterior'):
+        az.plot_posterior(trace, var_names=var_names)
+    else:
+        import arviz_plots as azp
+        azp.plot_trace_dist(trace, var_names=var_names)
+
+
+def _az_plot_dist_comparison(trace, var_names):
+    """plot_dist_comparison (arviz <1.0) or plot_prior_posterior (arviz_plots >=1.1)."""
+    if hasattr(az, 'plot_dist_comparison'):
+        az.plot_dist_comparison(trace, var_names=var_names)
+    else:
+        import arviz_plots as azp
+        azp.plot_prior_posterior(trace, var_names=var_names)
+
+
 def plot_arviz_diagnostics(trace, var_names, component_name, field, result_path):
     """
     Corner (pair), trace, posterior, and prior/posterior comparison plots
@@ -450,8 +468,6 @@ def plot_arviz_diagnostics(trace, var_names, component_name, field, result_path)
     skipped so old traces and new traces both work.  Each plot is wrapped in
     try/except so an API change in one ArviZ version cannot crash the pipeline.
     """
-    import arviz_plots as azp
-
     _post = trace.posterior
     if hasattr(_post, 'ds'):
         _post = _post.ds
@@ -480,18 +496,18 @@ def plot_arviz_diagnostics(trace, var_names, component_name, field, result_path)
         print(f'  WARNING: plot_trace failed for {component_name}: {e}')
 
     try:
-        azp.plot_trace_dist(trace, var_names=var_names)
+        _az_plot_posterior(trace, var_names)
         _save(f'{prefix}_posterior_{component_name}.png')
     except Exception as e:
         plt.close('all')
-        print(f'  WARNING: plot_trace_dist failed for {component_name}: {e}')
+        print(f'  WARNING: plot_posterior failed for {component_name}: {e}')
 
     try:
-        azp.plot_prior_posterior(trace, var_names=var_names)
+        _az_plot_dist_comparison(trace, var_names)
         _save(f'{prefix}_prior_comp_posterior_{component_name}.png')
     except Exception as e:
         plt.close('all')
-        print(f'  WARNING: plot_prior_posterior failed for {component_name}: {e}')
+        print(f'  WARNING: plot_dist_comparison failed for {component_name}: {e}')
 
     print(f'  Saved ArviZ diagnostics for {component_name}')
 

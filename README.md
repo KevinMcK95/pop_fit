@@ -27,14 +27,14 @@ The pipeline runs in a `conda` environment. The recommended setup uses `conda` w
 
 ```bash
 conda create -n pymc_new -c conda-forge \
-    "pymc>=5" "numpyro>=0.15" "arviz>=1.1" "arviz-plots>=1.1" \
+    "pymc>=5" "numpyro>=0.15" "arviz=0.23.4" \
     astropy astroquery scikit-learn "matplotlib>=3.9" \
     pandas scipy h5netcdf
 conda activate pymc_new
 ```
 
 Key version requirements:
-- **`arviz >= 1.1`** and **`arviz-plots >= 1.1`**: required for `plot_trace_dist` and `plot_prior_posterior` (the diagnostic plot API changed in 1.1). Both packages must be installed.
+- **`arviz=0.23.4`**: pinned because the diagnostic plot API (`plot_posterior`, `plot_dist_comparison`) was removed in arviz 1.x. The code falls back to the arviz_plots 1.1+ equivalents automatically if a newer version is installed, but the 0.23.x output looks significantly better.
 - **`h5netcdf`**: required to save the MCMC trace to NetCDF4 format (which supports multiple groups). Without it the trace cannot be written to disk.
 
 Then clone this repository:
