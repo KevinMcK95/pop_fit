@@ -99,6 +99,11 @@ def parse_args():
                    help='Max stars passed to the GMM (default 100000)')
     p.add_argument('--stop-after', type=int, default=9, metavar='N',
                    help='Stop pipeline after step N (1–9, default 9)')
+    p.add_argument('--from-trace', action='store_true',
+                   help='Load an existing trace and re-run steps 8–9 (diagnostic plots '
+                        'and membership) without re-running MCMC. Steps 1–4 are re-run '
+                        'quickly to reconstruct kinematic arrays; all model arrays are '
+                        'loaded from constant_data in the saved trace file.')
     p.add_argument('--binned-prior', action='store_true',
                    help='Use binned colour profiles instead of 2-D error-weighted KDE')
     p.add_argument('--spatial-profile', choices=['plummer', 'sersic'],
@@ -315,7 +320,8 @@ def _arrays_to_dataset(d):
 # ---------------------------------------------------------------------------
 
 def _save_run_outputs(trace, priors, pm_labels, kin,
-                      clean_sample, clean_background, result_path):
+                      clean_sample, clean_background, result_path,
+                      spatial_profile='sersic'):
     """Write posterior summary CSV and ancillary reference files.
 
     Files created
@@ -323,6 +329,7 @@ def _save_run_outputs(trace, priors, pm_labels, kin,
     posterior_parameter_summaries.csv  – prior/posterior stats for all GMM params
     run_metadata.json                  – G_ref, center priors, labels, timestamp
     photometry_kde_training.npz        – G/BP/RP training photometry for KDE
+                                         (skipped when clean_sample is None)
     """
     # Robustly extract posterior and prior as plain xr.Datasets regardless of
     # whether trace is an ArviZ InferenceData or newer xarray DataTree.
@@ -539,6 +546,7 @@ def _save_run_outputs(trace, priors, pm_labels, kin,
     meta = {
         'G_ref':            G_ref,
         'pm_labels':        list(pm_labels),
+        'spatial_profile':  spatial_profile,
         'ra_center_prior':  ra_c,
         'dec_center_prior': dec_c,
         'generated_utc':    datetime.now(timezone.utc).isoformat(),
@@ -549,19 +557,21 @@ def _save_run_outputs(trace, priors, pm_labels, kin,
     print(f'  Run metadata → {meta_path}')
 
     # photometry_kde_training.npz — training magnitudes + errors for each KDE
-    g  = kin['gmags']
-    bp = kin['bpmags']
-    rp = kin['rpmags']
-    np.savez(
-        os.path.join(result_path, 'photometry_kde_training.npz'),
-        member_gmags=g[clean_sample, 0],   member_gmag_errs=g[clean_sample, 1],
-        member_bpmags=bp[clean_sample, 0], member_bpmag_errs=bp[clean_sample, 1],
-        member_rpmags=rp[clean_sample, 0], member_rpmag_errs=rp[clean_sample, 1],
-        bg_gmags=g[clean_background, 0],   bg_gmag_errs=g[clean_background, 1],
-        bg_bpmags=bp[clean_background, 0], bg_bpmag_errs=bp[clean_background, 1],
-        bg_rpmags=rp[clean_background, 0], bg_rpmag_errs=rp[clean_background, 1],
-    )
-    print(f'  Photometry KDE training data → {os.path.join(result_path, "photometry_kde_training.npz")}')
+    # Skipped in --from-trace mode (clean_sample is None).
+    if clean_sample is not None and clean_background is not None:
+        g  = kin['gmags']
+        bp = kin['bpmags']
+        rp = kin['rpmags']
+        np.savez(
+            os.path.join(result_path, 'photometry_kde_training.npz'),
+            member_gmags=g[clean_sample, 0],   member_gmag_errs=g[clean_sample, 1],
+            member_bpmags=bp[clean_sample, 0], member_bpmag_errs=bp[clean_sample, 1],
+            member_rpmags=rp[clean_sample, 0], member_rpmag_errs=rp[clean_sample, 1],
+            bg_gmags=g[clean_background, 0],   bg_gmag_errs=g[clean_background, 1],
+            bg_bpmags=bp[clean_background, 0], bg_bpmag_errs=bp[clean_background, 1],
+            bg_rpmags=rp[clean_background, 0], bg_rpmag_errs=rp[clean_background, 1],
+        )
+        print(f'  Photometry KDE training data → {os.path.join(result_path, "photometry_kde_training.npz")}')
 
 
 # ---------------------------------------------------------------------------
@@ -639,6 +649,7 @@ def main():
     bpmags_qso_clean = rpmags_qso_clean = None
     gmag_errs_qso = bpmag_errs_qso = rpmag_errs_qso = None
     log_prior_qso_train_arr = None   # per-source catalog prior for training set
+    _pos_obs_qso_train      = None   # sky offsets of cleaned QSOs (for membership)
     n_gaia_raw        = 0
     delta_pm_sys_init = np.zeros(2)   # ICRS init; rotated to Galactic frame below if needed
 
@@ -766,6 +777,18 @@ def main():
         _p_train = np.log(0.99) if os.path.exists(MILLIQUAS_PATH) else np.log(0.50)
         log_prior_qso_train_arr = np.full(len(y_obs_qso), _p_train)
 
+        # Sky offsets for QSO training sources (used in membership step).
+        # Computed here so the result can be saved in constant_data for --from-trace.
+        _qso_ok = (np.isfinite(qso_clean_df['pmra'].to_numpy(dtype=float)) &
+                   np.isfinite(qso_clean_df['pmdec'].to_numpy(dtype=float)) &
+                   np.isfinite(qso_clean_df['parallax'].to_numpy(dtype=float)))
+        _ra_c_q  = float(priors['radec_center'][0])
+        _dec_c_q = float(priors['radec_center'][1])
+        _qra = qso_clean_df.loc[_qso_ok, 'ra'].to_numpy(dtype=float)
+        _qdc = qso_clean_df.loc[_qso_ok, 'dec'].to_numpy(dtype=float)
+        _dx_q = ((_qra - _ra_c_q + 180) % 360 - 180) * np.cos(np.deg2rad(_dec_c_q))
+        _pos_obs_qso_train = np.column_stack([_dx_q, _qdc - _dec_c_q])
+
     # ── 2. Initial selection ──────────────────────────────────────────────
     print('\n[2/9] Initial star selection...')
     keep, r_ell = initial_selection(kin, priors)
@@ -841,716 +864,941 @@ def main():
         print(f'Stopping after step 4.')
         return
 
-    # ── 5. Spatial model (optionally iterated) ───────────────────────────
+    # mcmc_path is used in steps 5 and 8; create it unconditionally here.
     mcmc_path = os.path.join(result_path, 'mcmc_summaries')
     os.makedirs(mcmc_path, exist_ok=True)
 
-    n_iter = max(1, args.n_init_density_fit)
-    print(f'\n[5/9] Running spatial (density-profile) model '
-          f'({n_iter} iteration{"s" if n_iter > 1 else ""})...')
+    # ── --from-trace: load saved trace and skip steps 5–7 ────────────────
+    if args.from_trace:
+        trace_path = os.path.join(result_path, f'{field}_trace.nc')
+        if not os.path.exists(trace_path):
+            raise FileNotFoundError(
+                f'--from-trace: no trace found at {trace_path}. '
+                f'Run the full pipeline first.')
+        print(f'\n[--from-trace] Loading trace from {trace_path}...')
+        import arviz as az
+        gmm_trace = az.from_netcdf(trace_path)
 
-    # Raw sky positions needed to re-center offsets between iterations
-    radecs_all = gaia_df[['ra', 'dec']].to_numpy()
+        # Restore pm_labels and spatial_profile from saved metadata.
+        _meta_path = os.path.join(result_path, 'run_metadata.json')
+        if os.path.exists(_meta_path):
+            with open(_meta_path) as _fh:
+                _meta = json.load(_fh)
+            pm_labels = tuple(_meta.get('pm_labels',
+                                         [r'$\mu_{\alpha*}$', r'$\mu_\delta$']))
+            _spatial_profile_saved = _meta.get('spatial_profile', args.spatial_profile)
+        else:
+            pm_labels = (r'$\mu_l \cos b$', r'$\mu_b$') if args.galactic_coords \
+                        else (r'$\mu_{\alpha*}$', r'$\mu_\delta$')
+            _spatial_profile_saved = args.spatial_profile
+        # Use the saved spatial profile so membership is consistent with the trace.
+        # Allow CLI to override only if the user explicitly passed the flag.
+        spatial_profile_ft = _spatial_profile_saved
+        args.spatial_profile = spatial_profile_ft  # propagate into membership call
 
-    # Anchor the hard upper bound for a_plummer to the ORIGINAL catalog value.
-    # This prevents iterated updates from gradually ratcheting the prior to
-    # unphysical scales (e.g. Draco finding 100-arcmin radii).
-    catalog_rhalf    = float(priors['rhalf_mean'])
-    max_a_plummer_sp = catalog_rhalf * 4.0
+        # Extract GMM posterior summary (sp dict): centre, shape, PA.
+        gmm_sp = extract_gmm_posterior(gmm_trace)
+        sp = gmm_sp
 
-    # Snapshot catalog spatial priors so the red "Prior" ellipses in density-
-    # profile plots always reflect the original catalog values, not the
-    # iteratively-absorbed updates.
-    original_spatial_priors = {k: priors[k]
-                                for k in ('pa_mean', 'ellipticity_mean', 'rhalf_mean')}
-    # Also snapshot the original centre so we can place the Prior ellipse at
-    # the original LVD position even after the frame has been shifted.
-    original_radec_center = priors['radec_center'].copy()
+        # Retrieve constant_data (may be DataTree node or plain Dataset).
+        _cdt_raw = gmm_trace['constant_data']
+        _cdt = _cdt_raw.ds if hasattr(_cdt_raw, 'ds') else _cdt_raw
 
-    # r_ell and photometric prior used for spatial model; updated between iterations
-    r_ell_spatial        = r_ell.copy()
-    prior_log_probs_iter = prior_log_probs_init.copy()
+        def _cd(name, default=None):
+            try:
+                return np.array(_cdt[name])
+            except (KeyError, Exception):
+                return default
 
-    for iter_idx in range(n_iter):
-        is_last = (iter_idx == n_iter - 1)
-        if n_iter > 1:
-            print(f'\n  -- Spatial iteration {iter_idx + 1}/{n_iter} --')
+        y_obs        = _cd('y_obs')
+        pos_obs      = _cd('pos_obs')
+        S_obs        = _cd('S_obs')
+        log_prior_ws = _cd('log_prior_ws')
+        gmags_obs    = _cd('gmags_obs')
+        bg_means     = _cd('bg_means')
+        bg_covs      = _cd('bg_covs')
+        bg_weights   = _cd('bg_weights')
+        keep_inds    = _cd('keep_inds')
+        _sa          = _cd('gmm_survey_area')
+        gmm_survey_area = float(_sa[0]) if _sa is not None else kin['survey_area']
+        _iqm = _cd('is_qso_main')
+        is_qso_main  = _iqm.astype(bool) if _iqm is not None \
+                       else np.zeros(len(gaia_df), dtype=bool)
+        _gtk = _cd('good_to_keep')
+        good_to_keep = _gtk.astype(bool) if _gtk is not None \
+                       else np.isfinite(kin['pms'][:, 0])
 
-        (keep_inds_sp, pos_obs_sp, _, _, log_prior_ws_sp,
-         _) = prepare_obs_arrays(
-            kin, priors, prior_log_probs_iter, None,
-            keep, bad_rhalf, r_ell_spatial, args.n_stars_max, args.seed,
+        # QSO arrays (only present when --qso-correction was active).
+        log_prior_qso_gmm      = _cd('log_prior_qso_gmm')
+        y_obs_qso              = _cd('y_obs_qso')
+        S_obs_qso              = _cd('S_obs_qso')
+        gmags_qso              = _cd('gmags_qso')
+        bpmags_qso_clean       = _cd('bpmags_qso_clean')
+        rpmags_qso_clean       = _cd('rpmags_qso_clean')
+        _pos_obs_qso_train     = _cd('pos_obs_qso_train')
+        log_prior_qso_train_arr = _cd('log_prior_qso_train')
+        _imm = _cd('is_milliquas_main')
+        is_milliquas_main = _imm.astype(bool) if _imm is not None \
+                            else np.zeros(len(gaia_df), dtype=bool)
+        _igom = _cd('is_gaia_only_main')
+        is_gaia_only_main = _igom.astype(bool) if _igom is not None \
+                            else np.zeros(len(gaia_df), dtype=bool)
+        qso_clean_df = None   # not needed past this point
+
+        # HST/BP3M arrays (only present when --bp3m-dir was active).
+        _ihm = _cd('is_hst_main_gmm')
+        is_hst_main_gmm = _ihm.astype(bool) if _ihm is not None else None
+        y_obs_hst_b_gmm     = _cd('y_obs_hst_b')
+        S_obs_hst_b_gmm     = _cd('S_obs_hst_b')
+        log_spatial_b_gmm   = _cd('log_spatial_hst_b')
+        _ha = _cd('hst_area')
+        hst_area_gmm        = float(_ha[0]) if _ha is not None else None
+        log_prior_ws_b_gmm  = _cd('log_prior_ws_hst_b')
+        S_latent_hst_a_gmm  = _cd('S_latent_hst_a')
+        S_latent_hst_b_gmm  = _cd('S_latent_hst_b')
+
+        # Group B plot/CSV data saved as separate arrays.
+        _hst_b_pos    = _cd('hst_b_pos')
+        _hst_b_pms    = _cd('hst_b_pms')
+        _hst_b_colors = _cd('hst_b_colors')
+        _hst_b_gmags  = _cd('hst_b_gmags')
+        _hst_b_probs  = _cd('hst_b_prior_probs')
+        hst_b_pos_gmm         = _hst_b_pos
+        hst_b_prior_probs_gmm = _hst_b_probs
+        _hst_b_data = None
+        if _hst_b_pos is not None:
+            _hst_b_data = {
+                'pos':    _hst_b_pos,    'pms':    _hst_b_pms,
+                'colors': _hst_b_colors, 'gmags':  _hst_b_gmags,
+                'probs':  _hst_b_probs,
+            }
+
+        # Reconstruct a minimal Group B dataframe for CSV output.
+        bp3m_b_df_gmm = None
+        _hst_b_gaia_id  = _cd('hst_b_gaia_id')
+        _hst_b_ra       = _cd('hst_b_ra')
+        _hst_b_dec      = _cd('hst_b_dec')
+        _hst_b_pmra_bp3m  = _cd('hst_b_pmra_bp3m')
+        _hst_b_pmdec_bp3m = _cd('hst_b_pmdec_bp3m')
+        _hst_b_plx        = _cd('hst_b_parallax_bp3m')
+        _hst_b_nhst       = _cd('hst_b_n_hst_used')
+        if (_hst_b_gaia_id is not None and y_obs_hst_b_gmm is not None):
+            import pandas as pd
+            bp3m_b_df_gmm = pd.DataFrame({
+                'Gaia_id':        _hst_b_gaia_id,
+                'ra':             _hst_b_ra   if _hst_b_ra   is not None else np.zeros(len(_hst_b_gaia_id)),
+                'dec':            _hst_b_dec  if _hst_b_dec  is not None else np.zeros(len(_hst_b_gaia_id)),
+                'pmra_bp3m':      _hst_b_pmra_bp3m  if _hst_b_pmra_bp3m  is not None else y_obs_hst_b_gmm[:, 0],
+                'pmdec_bp3m':     _hst_b_pmdec_bp3m if _hst_b_pmdec_bp3m is not None else y_obs_hst_b_gmm[:, 1],
+                'parallax_bp3m':  _hst_b_plx        if _hst_b_plx        is not None else y_obs_hst_b_gmm[:, 2],
+                'gmag':           _hst_b_gmags if _hst_b_gmags is not None else np.zeros(len(_hst_b_gaia_id)),
+                'n_hst_used':     _hst_b_nhst  if _hst_b_nhst  is not None else np.zeros(len(_hst_b_gaia_id)),
+            })
+
+        # Reconstruct r_ell_updated and morphology priors needed for step 8.
+        r_ell_updated = compute_elliptical_r(
+            kin['radec_offsets'],
+            sp['new_delta_ra_center'], sp['new_delta_dec_center'],
+            sp['new_pa_deg'], sp['new_ellipticity'],
+            scale_deg=priors['rhalf_mean'] / 60.0,
         )
+        original_radec_center   = priors['radec_center'].copy()
+        original_spatial_priors = {k: priors[k]
+                                   for k in ('pa_mean', 'ellipticity_mean', 'rhalf_mean')}
+        clean_sample     = None   # skip photometry_kde_training.npz in _save_run_outputs
+        clean_background = None
+        prior_log_probs  = None   # not needed after good_to_keep loaded from constant_data
 
-        # Only fit stars with kinematics consistent with the expected dwarf PM.
-        # This removes most MW contamination that would otherwise inflate a_plummer
-        # in dense / contaminated fields (e.g. Draco).
-        keep_subset = kin['pm_and_para_dists'][keep_inds_sp] < 2
-        keep_inds_sp    = keep_inds_sp[keep_subset]
-        pos_obs_sp      = pos_obs_sp[keep_subset]
-        log_prior_ws_sp = log_prior_ws_sp[keep_subset]
+        n_gmm = len(y_obs) if y_obs is not None else 0
+        print(f'  Restored: {n_gmm:,} GMM stars, '
+              f'survey area = {gmm_survey_area:.5f} deg²')
+        if keep_inds is not None:
+            print(f'  keep_inds: {len(keep_inds):,}  '
+                  f'is_qso_main: {is_qso_main.sum():,}  '
+                  f'good_to_keep: {good_to_keep.sum():,}')
+        if log_prior_qso_gmm is not None:
+            print(f'  QSO correction active ({len(y_obs_qso):,} training QSOs)')
+        if is_hst_main_gmm is not None:
+            print(f'  HST/BP3M active ({is_hst_main_gmm.sum():,} Group A, '
+                  f'{len(y_obs_hst_b_gmm) if y_obs_hst_b_gmm is not None else 0:,} Group B)')
 
-        # Estimate f_dwarf for the spatial model from the photometric prior:
-        # sum of exp(log_prior_ws[:,0]) gives the expected number of dwarf
-        # members in the PM-cut sample.  This is self-consistent with the
-        # sample composition without needing to extrapolate background density.
-        _N_eff_sp       = float(np.sum(np.exp(log_prior_ws_sp[:, 0])))
-        f_dwarf_sp_prior = float(np.clip(_N_eff_sp / max(len(log_prior_ws_sp), 1),
-                                          0.001, 0.999))
-        print(f'  Spatial f_dwarf prior: {f_dwarf_sp_prior:.4f}  '
-              f'(~{_N_eff_sp:.0f} / {len(log_prior_ws_sp):,} stars PM-selected)')
+    # ── 5–7. Spatial model, photometric prior, GMM (skipped with --from-trace) ──
+    # In --from-trace mode the trace is already loaded and all variables are set
+    # above; raise _SkipToStep8 to jump past the MCMC steps.
+    class _SkipToStep8(Exception):
+        pass
+    try:
+        if args.from_trace:
+            raise _SkipToStep8()
 
-        spatial_model = build_spatial_model(
-            pos_obs_sp, log_prior_ws_sp, kin['survey_area'], priors, bad_rhalf,
-            spatial_profile=args.spatial_profile,
-            max_a_plummer=max_a_plummer_sp,
-            f_dwarf_prior=f_dwarf_sp_prior,
-        )
-        spatial_trace = run_spatial_model(
-            spatial_model,
-            draws=args.spatial_draws, tune=args.spatial_tune,
-            chains=args.chains, seed=args.seed,
-        )
-        sp = extract_spatial_posterior(spatial_trace)
-        print(f'  Posterior a_plummer   = {sp["new_a_plummer"]:.2f} ± {sp["new_a_plummer_err"]:.2f} arcmin')
-        print(f'  Posterior ellipticity = {sp["new_ellipticity"]:.3f} ± {sp["new_ellipticity_err"]:.3f}')
-        print(f'  Posterior PA          = {sp["new_pa_deg"]:.1f} ± {sp["new_pa_deg_err"]:.1f} deg')
+        # ── 5. Spatial model (optionally iterated) ────────────────────────
 
-        iter_tag = f'iter_{iter_idx + 1}' if n_iter > 1 else ''
-        plot_spatial_diagnostics(spatial_trace, field, mcmc_path, tag=iter_tag)
+        n_iter = max(1, args.n_init_density_fit)
+        print(f'\n[5/9] Running spatial (density-profile) model '
+              f'({n_iter} iteration{"s" if n_iter > 1 else ""})...')
 
-        # Density profile plot per iteration: always compare against the original
-        # catalog priors (red ellipses) so the reference is stable across iterations.
-        sp_plot_tag = f'update_{iter_tag}' if iter_tag else 'update'
-        _r_ell_sp = (
-            compute_elliptical_r(
-                kin['radec_offsets'],
-                sp['new_delta_ra_center'], sp['new_delta_dec_center'],
-                sp['new_pa_deg'], sp['new_ellipticity'],
-                scale_deg=original_spatial_priors['rhalf_mean'] / 60.0,
-            ) if not bad_rhalf
-            else np.full(len(kin['radec_offsets']), np.nan)
-        )
-        # Prior ellipse centre in the current offset frame (non-zero only
-        # when iterated centre updates have shifted the frame origin).
-        _cos_dec_sp = np.cos(np.deg2rad(priors['radec_center'][1]))
-        _prior_cen_sp = (
-            (((original_radec_center[0] - priors['radec_center'][0])+180.0)%360.0-180.0) * _cos_dec_sp,
-            (original_radec_center[1] - priors['radec_center'][1]),
-        )
-        plot_density_profile(
-            kin['radec_offsets'], _r_ell_sp,
-            original_spatial_priors, sp, result_path, tag=sp_plot_tag,
-            prior_center=_prior_cen_sp,
-        )
+        # Raw sky positions needed to re-center offsets between iterations
+        radecs_all = gaia_df[['ra', 'dec']].to_numpy()
 
-        if not is_last:
-            # Absorb centre offset into priors and recompute kin positions.
-            # Prior WIDTHS (rhalf_err, ellipticity_err, pa_err) are kept fixed.
-            cos_dec = np.cos(np.deg2rad(priors['radec_center'][1]))
-            priors['radec_center'] = np.array([
-                priors['radec_center'][0]
-                    + sp['new_delta_ra_center'] / 60.0 / cos_dec,
-                priors['radec_center'][1]
-                    + sp['new_delta_dec_center'] / 60.0,
-            ])
-            # Cap the scale radius update: don't let iterative re-centering
-            # ratchet rhalf_mean beyond 3× the original catalog value.
-            priors['rhalf_mean']       = min(float(sp['new_a_plummer']),
-                                             3.0 * catalog_rhalf)
-            priors['ellipticity_mean'] = sp['new_ellipticity']
-            priors['pa_mean']          = sp['new_pa_deg']
+        # Anchor the hard upper bound for a_plummer to the ORIGINAL catalog value.
+        # This prevents iterated updates from gradually ratcheting the prior to
+        # unphysical scales (e.g. Draco finding 100-arcmin radii).
+        catalog_rhalf    = float(priors['rhalf_mean'])
+        max_a_plummer_sp = catalog_rhalf * 4.0
 
-            # Recompute offsets from the new centre
-            new_offsets = radecs_all - priors['radec_center']
-            new_offsets[:, 0] = (new_offsets[:, 0] + 180.0)%360.0 - 180.0
-            new_offsets[:, 0] *= np.cos(np.deg2rad(priors['radec_center'][1]))
-            kin['radec_offsets'] = new_offsets
+        # Snapshot catalog spatial priors so the red "Prior" ellipses in density-
+        # profile plots always reflect the original catalog values, not the
+        # iteratively-absorbed updates.
+        original_spatial_priors = {k: priors[k]
+                                    for k in ('pa_mean', 'ellipticity_mean', 'rhalf_mean')}
+        # Also snapshot the original centre so we can place the Prior ellipse at
+        # the original LVD position even after the frame has been shifted.
+        original_radec_center = priors['radec_center'].copy()
 
-            # Recompute r_ell for the next iteration (delta already absorbed)
-            r_ell_spatial = (
+        # r_ell and photometric prior used for spatial model; updated between iterations
+        r_ell_spatial        = r_ell.copy()
+        prior_log_probs_iter = prior_log_probs_init.copy()
+
+        for iter_idx in range(n_iter):
+            is_last = (iter_idx == n_iter - 1)
+            if n_iter > 1:
+                print(f'\n  -- Spatial iteration {iter_idx + 1}/{n_iter} --')
+
+            (keep_inds_sp, pos_obs_sp, _, _, log_prior_ws_sp,
+             _) = prepare_obs_arrays(
+                kin, priors, prior_log_probs_iter, None,
+                keep, bad_rhalf, r_ell_spatial, args.n_stars_max, args.seed,
+            )
+
+            # Only fit stars with kinematics consistent with the expected dwarf PM.
+            # This removes most MW contamination that would otherwise inflate a_plummer
+            # in dense / contaminated fields (e.g. Draco).
+            keep_subset = kin['pm_and_para_dists'][keep_inds_sp] < 2
+            keep_inds_sp    = keep_inds_sp[keep_subset]
+            pos_obs_sp      = pos_obs_sp[keep_subset]
+            log_prior_ws_sp = log_prior_ws_sp[keep_subset]
+
+            # Estimate f_dwarf for the spatial model from the photometric prior:
+            # sum of exp(log_prior_ws[:,0]) gives the expected number of dwarf
+            # members in the PM-cut sample.  This is self-consistent with the
+            # sample composition without needing to extrapolate background density.
+            _N_eff_sp       = float(np.sum(np.exp(log_prior_ws_sp[:, 0])))
+            f_dwarf_sp_prior = float(np.clip(_N_eff_sp / max(len(log_prior_ws_sp), 1),
+                                              0.001, 0.999))
+            print(f'  Spatial f_dwarf prior: {f_dwarf_sp_prior:.4f}  '
+                  f'(~{_N_eff_sp:.0f} / {len(log_prior_ws_sp):,} stars PM-selected)')
+
+            spatial_model = build_spatial_model(
+                pos_obs_sp, log_prior_ws_sp, kin['survey_area'], priors, bad_rhalf,
+                spatial_profile=args.spatial_profile,
+                max_a_plummer=max_a_plummer_sp,
+                f_dwarf_prior=f_dwarf_sp_prior,
+            )
+            spatial_trace = run_spatial_model(
+                spatial_model,
+                draws=args.spatial_draws, tune=args.spatial_tune,
+                chains=args.chains, seed=args.seed,
+            )
+            sp = extract_spatial_posterior(spatial_trace)
+            print(f'  Posterior a_plummer   = {sp["new_a_plummer"]:.2f} ± {sp["new_a_plummer_err"]:.2f} arcmin')
+            print(f'  Posterior ellipticity = {sp["new_ellipticity"]:.3f} ± {sp["new_ellipticity_err"]:.3f}')
+            print(f'  Posterior PA          = {sp["new_pa_deg"]:.1f} ± {sp["new_pa_deg_err"]:.1f} deg')
+
+            iter_tag = f'iter_{iter_idx + 1}' if n_iter > 1 else ''
+            plot_spatial_diagnostics(spatial_trace, field, mcmc_path, tag=iter_tag)
+
+            # Density profile plot per iteration: always compare against the original
+            # catalog priors (red ellipses) so the reference is stable across iterations.
+            sp_plot_tag = f'update_{iter_tag}' if iter_tag else 'update'
+            _r_ell_sp = (
                 compute_elliptical_r(
-                    kin['radec_offsets'], 0.0, 0.0,
-                    priors['pa_mean'], priors['ellipticity_mean'],
-                    scale_deg=priors['rhalf_mean'] / 60.0,
+                    kin['radec_offsets'],
+                    sp['new_delta_ra_center'], sp['new_delta_dec_center'],
+                    sp['new_pa_deg'], sp['new_ellipticity'],
+                    scale_deg=original_spatial_priors['rhalf_mean'] / 60.0,
                 ) if not bad_rhalf
                 else np.full(len(kin['radec_offsets']), np.nan)
             )
-
-            # Refit background GMM with the updated elliptical radii
-            print(f'  Refitting background GMM ({iter_tag})...')
-            *_, good_bgs_iter = compute_background_stats(
-                kin['pm_and_paras'], r_ell_spatial, kin['has_pms'],
+            # Prior ellipse centre in the current offset frame (non-zero only
+            # when iterated centre updates have shifted the frame origin).
+            _cos_dec_sp = np.cos(np.deg2rad(priors['radec_center'][1]))
+            _prior_cen_sp = (
+                (((original_radec_center[0] - priors['radec_center'][0])+180.0)%360.0-180.0) * _cos_dec_sp,
+                (original_radec_center[1] - priors['radec_center'][1]),
             )
-            good_bgs_iter &= ~is_qso_main
-            bg_means, bg_covs, bg_weights = fit_background_gmm(
-                kin['pm_and_paras'], good_bgs_iter,
-                n_components=args.bg_components,
-            )
-            print(f'  Background GMM: K={len(bg_weights)}, '
-                  f'{good_bgs_iter.sum():,} background stars')
-            plot_background_gmm(
-                kin['pm_and_paras'], good_bgs_iter,
-                bg_means, bg_covs, bg_weights,
-                kin['radec_offsets'], r_ell_spatial,
-                result_path, tag=iter_tag,
-                gmags=kin['gmags'], colors=kin['colors'],
-                pm_labels=pm_labels,
+            plot_density_profile(
+                kin['radec_offsets'], _r_ell_sp,
+                original_spatial_priors, sp, result_path, tag=sp_plot_tag,
+                prior_center=_prior_cen_sp,
             )
 
-            # Recompute photometric prior with updated background definition
-            clean_sample_iter = (
-                (r_ell_spatial <= 2) & kin['has_pms']
-                & (kin['pm_and_para_dists'] <= 2) & kin['good_mags']
-                & ~is_qso_main
-            )
-            clean_bg_iter, _ = _background_mask(
-                r_ell_spatial, kin['has_pms'], kin['good_mags'],
-            )
-            clean_bg_iter &= ~is_qso_main
-            print(f'  Recomputing photometric prior ({iter_tag})...')
-            if not args.binned_prior:
-                prior_log_probs_iter = compute_photometric_prior_kde(
-                    kin['gmags'], kin['rpmags'], kin['bpmags'],
-                    clean_sample_iter, clean_bg_iter, priors['gmag_limit'],
+            if not is_last:
+                # Absorb centre offset into priors and recompute kin positions.
+                # Prior WIDTHS (rhalf_err, ellipticity_err, pa_err) are kept fixed.
+                cos_dec = np.cos(np.deg2rad(priors['radec_center'][1]))
+                priors['radec_center'] = np.array([
+                    priors['radec_center'][0]
+                        + sp['new_delta_ra_center'] / 60.0 / cos_dec,
+                    priors['radec_center'][1]
+                        + sp['new_delta_dec_center'] / 60.0,
+                ])
+                # Cap the scale radius update: don't let iterative re-centering
+                # ratchet rhalf_mean beyond 3× the original catalog value.
+                priors['rhalf_mean']       = min(float(sp['new_a_plummer']),
+                                                 3.0 * catalog_rhalf)
+                priors['ellipticity_mean'] = sp['new_ellipticity']
+                priors['pa_mean']          = sp['new_pa_deg']
+
+                # Recompute offsets from the new centre
+                new_offsets = radecs_all - priors['radec_center']
+                new_offsets[:, 0] = (new_offsets[:, 0] + 180.0)%360.0 - 180.0
+                new_offsets[:, 0] *= np.cos(np.deg2rad(priors['radec_center'][1]))
+                kin['radec_offsets'] = new_offsets
+
+                # Recompute r_ell for the next iteration (delta already absorbed)
+                r_ell_spatial = (
+                    compute_elliptical_r(
+                        kin['radec_offsets'], 0.0, 0.0,
+                        priors['pa_mean'], priors['ellipticity_mean'],
+                        scale_deg=priors['rhalf_mean'] / 60.0,
+                    ) if not bad_rhalf
+                    else np.full(len(kin['radec_offsets']), np.nan)
                 )
-                color_profiles_iter = {}
-            else:
-                prior_log_probs_iter, color_profiles_iter = compute_photometric_prior(
-                    kin['gmags'], kin['rpmags'], kin['bpmags'],
-                    clean_sample_iter, clean_bg_iter, priors['gmag_limit'],
+
+                # Refit background GMM with the updated elliptical radii
+                print(f'  Refitting background GMM ({iter_tag})...')
+                *_, good_bgs_iter = compute_background_stats(
+                    kin['pm_and_paras'], r_ell_spatial, kin['has_pms'],
                 )
-            prior_log_probs_iter[kin['pm_and_para_dists'] >= 5] = -1e10
-            plot_cmd_prior_diagnostics(
-                kin['gmags'], kin['rpmags'], kin['bpmags'],
-                clean_sample_iter, clean_bg_iter,
-                prior_log_probs_iter, color_profiles_iter,
-                result_path, tag=iter_tag,
-            )
+                good_bgs_iter &= ~is_qso_main
+                bg_means, bg_covs, bg_weights = fit_background_gmm(
+                    kin['pm_and_paras'], good_bgs_iter,
+                    n_components=args.bg_components,
+                )
+                print(f'  Background GMM: K={len(bg_weights)}, '
+                      f'{good_bgs_iter.sum():,} background stars')
+                plot_background_gmm(
+                    kin['pm_and_paras'], good_bgs_iter,
+                    bg_means, bg_covs, bg_weights,
+                    kin['radec_offsets'], r_ell_spatial,
+                    result_path, tag=iter_tag,
+                    gmags=kin['gmags'], colors=kin['colors'],
+                    pm_labels=pm_labels,
+                )
 
-    if args.stop_after <= 5:
-        print(f'Stopping after step 5.')
-        return
-
-    # ── 6. Recompute morphology and photometric prior ─────────────────────
-    print('\n[6/9] Recomputing morphology and photometric prior...')
-
-    if bad_rhalf:
-        # Estimate rhalf from the confident members found with initial prior
-        confident = keep & (np.exp(prior_log_probs_init) > 0.5)
-        r_ell_deg = compute_elliptical_r(
-            kin['radec_offsets'], 0.0, 0.0,
-            priors['pa_mean'], priors['ellipticity_mean'],
-            scale_deg=1.0,  # unnormalised; result is in degrees
-        )
-        if confident.sum() > 5:
-            priors['rhalf_mean'] = float(np.nanmedian(r_ell_deg[confident]) * 60)
-            priors['rhalf_err']  = 0.5 * priors['rhalf_mean']
-        print(f'  Estimated rhalf_mean = {priors["rhalf_mean"]:.2f} arcmin')
-
-    # r_ell normalized by CATALOG rhalf (for clean_sample thresholds)
-    r_ell_updated = compute_elliptical_r(
-        kin['radec_offsets'],
-        sp['new_delta_ra_center'], sp['new_delta_dec_center'],
-        sp['new_pa_deg'], sp['new_ellipticity'],
-        scale_deg=priors['rhalf_mean'] / 60.0,
-    )
-
-    clean_sample = ((r_ell_updated <= 2) & kin['has_pms']
+                # Recompute photometric prior with updated background definition
+                clean_sample_iter = (
+                    (r_ell_spatial <= 2) & kin['has_pms']
                     & (kin['pm_and_para_dists'] <= 2) & kin['good_mags']
-                    & ~is_qso_main)
-    clean_background, bg_thresh = _background_mask(
-        r_ell_updated, kin['has_pms'], kin['good_mags'],
-    )
-    clean_background &= ~is_qso_main
-    print(f'  clean_sample={clean_sample.sum():,}  '
-          f'clean_background={clean_background.sum():,} '
-          + (f'(r_ell ≥ {bg_thresh:.0f} × rhalf)'
-             if bg_thresh is not None else '(bad_rhalf fallback)'))
+                    & ~is_qso_main
+                )
+                clean_bg_iter, _ = _background_mask(
+                    r_ell_spatial, kin['has_pms'], kin['good_mags'],
+                )
+                clean_bg_iter &= ~is_qso_main
+                print(f'  Recomputing photometric prior ({iter_tag})...')
+                if not args.binned_prior:
+                    prior_log_probs_iter = compute_photometric_prior_kde(
+                        kin['gmags'], kin['rpmags'], kin['bpmags'],
+                        clean_sample_iter, clean_bg_iter, priors['gmag_limit'],
+                    )
+                    color_profiles_iter = {}
+                else:
+                    prior_log_probs_iter, color_profiles_iter = compute_photometric_prior(
+                        kin['gmags'], kin['rpmags'], kin['bpmags'],
+                        clean_sample_iter, clean_bg_iter, priors['gmag_limit'],
+                    )
+                prior_log_probs_iter[kin['pm_and_para_dists'] >= 5] = -1e10
+                plot_cmd_prior_diagnostics(
+                    kin['gmags'], kin['rpmags'], kin['bpmags'],
+                    clean_sample_iter, clean_bg_iter,
+                    prior_log_probs_iter, color_profiles_iter,
+                    result_path, tag=iter_tag,
+                )
 
-    # Refit background GMM with updated morphology — the spatial model may
-    # have substantially changed the centre/shape estimate (e.g. NGC_300 where
-    # the LVD prior is poor), meaning the initial r_ell cut might have included
-    # real galaxy members in the background training set.
-    print('  Refitting background GMM with updated morphology...')
-    *_, good_backgrounds = compute_background_stats(
-        kin['pm_and_paras'], r_ell_updated, kin['has_pms'],
-    )
-    good_backgrounds &= ~is_qso_main
-    print(f'  Refined background: {good_backgrounds.sum():,} stars '
-          f'(r_ell ≥ {GAIA_BG_SPATIAL_THRESHOLD:.0f} × rhalf, spatial posterior)')
-    bg_means, bg_covs, bg_weights = fit_background_gmm(
-        kin['pm_and_paras'], good_backgrounds, n_components=args.bg_components,
-    )
-    print(f'  Refined background GMM: K={len(bg_weights)} components')
-    plot_background_gmm(
-        kin['pm_and_paras'], good_backgrounds,
-        bg_means, bg_covs, bg_weights,
-        kin['radec_offsets'], r_ell_updated,
-        result_path, tag='updated',
-        gmags=kin['gmags'], colors=kin['colors'],
-        pm_labels=pm_labels,
-    )
+        if args.stop_after <= 5:
+            print(f'Stopping after step 5.')
+            return
 
-    if not args.binned_prior:
-        prior_log_probs = compute_photometric_prior_kde(
-            kin['gmags'], kin['rpmags'], kin['bpmags'],
-            clean_sample, clean_background, priors['gmag_limit'],
+        # ── 6. Recompute morphology and photometric prior ─────────────────────
+        print('\n[6/9] Recomputing morphology and photometric prior...')
+
+        if bad_rhalf:
+            # Estimate rhalf from the confident members found with initial prior
+            confident = keep & (np.exp(prior_log_probs_init) > 0.5)
+            r_ell_deg = compute_elliptical_r(
+                kin['radec_offsets'], 0.0, 0.0,
+                priors['pa_mean'], priors['ellipticity_mean'],
+                scale_deg=1.0,  # unnormalised; result is in degrees
+            )
+            if confident.sum() > 5:
+                priors['rhalf_mean'] = float(np.nanmedian(r_ell_deg[confident]) * 60)
+                priors['rhalf_err']  = 0.5 * priors['rhalf_mean']
+            print(f'  Estimated rhalf_mean = {priors["rhalf_mean"]:.2f} arcmin')
+
+        # r_ell normalized by CATALOG rhalf (for clean_sample thresholds)
+        r_ell_updated = compute_elliptical_r(
+            kin['radec_offsets'],
+            sp['new_delta_ra_center'], sp['new_delta_dec_center'],
+            sp['new_pa_deg'], sp['new_ellipticity'],
+            scale_deg=priors['rhalf_mean'] / 60.0,
         )
-        color_profiles = {}
-    else:
-        prior_log_probs, color_profiles = compute_photometric_prior(
-            kin['gmags'], kin['rpmags'], kin['bpmags'],
-            clean_sample, clean_background, priors['gmag_limit'],
+
+        clean_sample = ((r_ell_updated <= 2) & kin['has_pms']
+                        & (kin['pm_and_para_dists'] <= 2) & kin['good_mags']
+                        & ~is_qso_main)
+        clean_background, bg_thresh = _background_mask(
+            r_ell_updated, kin['has_pms'], kin['good_mags'],
         )
-    prior_log_probs[kin['pm_and_para_dists'] >= 5] = -1e10
+        clean_background &= ~is_qso_main
+        print(f'  clean_sample={clean_sample.sum():,}  '
+              f'clean_background={clean_background.sum():,} '
+              + (f'(r_ell ≥ {bg_thresh:.0f} × rhalf)'
+                 if bg_thresh is not None else '(bad_rhalf fallback)'))
 
-    plot_cmd_prior_diagnostics(
-        kin['gmags'], kin['rpmags'], kin['bpmags'],
-        clean_sample, clean_background,
-        prior_log_probs, color_profiles,
-        result_path, tag='updated',
-    )
+        # Refit background GMM with updated morphology — the spatial model may
+        # have substantially changed the centre/shape estimate (e.g. NGC_300 where
+        # the LVD prior is poor), meaning the initial r_ell cut might have included
+        # real galaxy members in the background training set.
+        print('  Refitting background GMM with updated morphology...')
+        *_, good_backgrounds = compute_background_stats(
+            kin['pm_and_paras'], r_ell_updated, kin['has_pms'],
+        )
+        good_backgrounds &= ~is_qso_main
+        print(f'  Refined background: {good_backgrounds.sum():,} stars '
+              f'(r_ell ≥ {GAIA_BG_SPATIAL_THRESHOLD:.0f} × rhalf, spatial posterior)')
+        bg_means, bg_covs, bg_weights = fit_background_gmm(
+            kin['pm_and_paras'], good_backgrounds, n_components=args.bg_components,
+        )
+        print(f'  Refined background GMM: K={len(bg_weights)} components')
+        plot_background_gmm(
+            kin['pm_and_paras'], good_backgrounds,
+            bg_means, bg_covs, bg_weights,
+            kin['radec_offsets'], r_ell_updated,
+            result_path, tag='updated',
+            gmags=kin['gmags'], colors=kin['colors'],
+            pm_labels=pm_labels,
+        )
 
-    if args.stop_after <= 6:
-        print(f'Stopping after step 6.')
-        return
-
-    # ── 7. Prepare GMM data and run ───────────────────────────────────────
-    print('\n[7/9] Running full GMM...')
-    GMM_MAX_R_ELL = 7.0   # selection radius in units of rhalf
-    (keep_inds, pos_obs, y_obs, S_obs,
-     log_prior_ws, good_to_keep) = prepare_obs_arrays(
-        kin, priors, prior_log_probs, None,
-        keep, bad_rhalf, r_ell_updated, args.n_stars_max, args.seed,
-        max_r_ell=GMM_MAX_R_ELL,
-    )
-
-    # --- BP3M injection at step 7 ---
-    # Group A: Gaia stars also in BP3M → substitute y_obs/S_obs with BP3M values.
-    # Group B: BP3M-only stars (G > 20.7, not in gaia_df) → separate dataset.
-    # In latent mode (v2): use conditional means + C_vT; build S_latent padding.
-    is_hst_main_gmm       = None
-    y_obs_hst_b_gmm       = None
-    S_obs_hst_b_gmm       = None
-    log_spatial_b_gmm     = None
-    log_prior_ws_b_gmm    = None
-    hst_area_gmm          = None
-    hst_pm_sys_init       = None
-    bp3m_b_df_gmm         = None
-    hst_b_pos_gmm         = None   # sky offsets for Group B (for plots)
-    hst_b_prior_probs_gmm = None   # P(member|CMD) for Group B (for plots)
-    S_latent_hst_a_gmm    = None   # (N_gmm, 3, M) padded sensitivity (latent v2)
-    S_latent_hst_b_gmm    = None   # (N_B, 3, M) Group B sensitivity (latent v2)
-
-    _use_latent = S_pm_bp3m is not None  # True only when latent mode succeeded
-
-    if bp3m_df is not None:
-        # Build ID lookup: Gaia source_id → row index in gaia_df
-        gaia_source_ids = gaia_df['source_id'].values if 'source_id' in gaia_df.columns else None
-        bp3m_id_to_row  = {int(gid): i for i, gid in enumerate(bp3m_df['Gaia_id'].values)}
-        if _use_latent:
-            latent_id_to_row = {int(gid): i
-                                for i, gid in enumerate(latent_gaia_ids)}
+        if not args.binned_prior:
+            prior_log_probs = compute_photometric_prior_kde(
+                kin['gmags'], kin['rpmags'], kin['bpmags'],
+                clean_sample, clean_background, priors['gmag_limit'],
+            )
+            color_profiles = {}
         else:
-            latent_id_to_row = {}
+            prior_log_probs, color_profiles = compute_photometric_prior(
+                kin['gmags'], kin['rpmags'], kin['bpmags'],
+                clean_sample, clean_background, priors['gmag_limit'],
+            )
+        prior_log_probs[kin['pm_and_para_dists'] >= 5] = -1e10
 
-        if gaia_source_ids is not None:
-            # Find which GMM stars are in BP3M (Group A mask over keep_inds)
-            gmm_gaia_ids  = gaia_source_ids[keep_inds]
-            hst_a_in_gmm  = np.array([int(gid) in bp3m_id_to_row
-                                       for gid in gmm_gaia_ids], dtype=bool)
-            is_hst_main_gmm = hst_a_in_gmm
-            N_gmm = len(y_obs)
+        plot_cmd_prior_diagnostics(
+            kin['gmags'], kin['rpmags'], kin['bpmags'],
+            clean_sample, clean_background,
+            prior_log_probs, color_profiles,
+            result_path, tag='updated',
+        )
 
-            # In latent mode, allocate padded sensitivity matrix for Group A
+        if args.stop_after <= 6:
+            print(f'Stopping after step 6.')
+            return
+
+        # ── 7. Prepare GMM data and run ───────────────────────────────────────
+        print('\n[7/9] Running full GMM...')
+        GMM_MAX_R_ELL = 7.0   # selection radius in units of rhalf
+        (keep_inds, pos_obs, y_obs, S_obs,
+         log_prior_ws, good_to_keep) = prepare_obs_arrays(
+            kin, priors, prior_log_probs, None,
+            keep, bad_rhalf, r_ell_updated, args.n_stars_max, args.seed,
+            max_r_ell=GMM_MAX_R_ELL,
+        )
+
+        # --- BP3M injection at step 7 ---
+        # Group A: Gaia stars also in BP3M → substitute y_obs/S_obs with BP3M values.
+        # Group B: BP3M-only stars (G > 20.7, not in gaia_df) → separate dataset.
+        # In latent mode (v2): use conditional means + C_vT; build S_latent padding.
+        is_hst_main_gmm       = None
+        y_obs_hst_b_gmm       = None
+        S_obs_hst_b_gmm       = None
+        log_spatial_b_gmm     = None
+        log_prior_ws_b_gmm    = None
+        hst_area_gmm          = None
+        hst_pm_sys_init       = None
+        bp3m_b_df_gmm         = None
+        hst_b_pos_gmm         = None   # sky offsets for Group B (for plots)
+        hst_b_prior_probs_gmm = None   # P(member|CMD) for Group B (for plots)
+        S_latent_hst_a_gmm    = None   # (N_gmm, 3, M) padded sensitivity (latent v2)
+        S_latent_hst_b_gmm    = None   # (N_B, 3, M) Group B sensitivity (latent v2)
+
+        _use_latent = S_pm_bp3m is not None  # True only when latent mode succeeded
+
+        if bp3m_df is not None:
+            # Build ID lookup: Gaia source_id → row index in gaia_df
+            gaia_source_ids = gaia_df['source_id'].values if 'source_id' in gaia_df.columns else None
+            bp3m_id_to_row  = {int(gid): i for i, gid in enumerate(bp3m_df['Gaia_id'].values)}
             if _use_latent:
-                _N_modes_a = S_pm_bp3m.shape[2]
-                S_latent_hst_a_gmm = np.zeros((N_gmm, 3, _N_modes_a))
-
-            # Substitute y_obs / S_obs for Group A stars.
-            # Latent (v2): use conditional means + C_vT_pm.
-            # V1:          use marginal means + C_pm (C_obs).
-            n_subst = 0
-            n_chi2_rejected = 0
-            _chi2_thr = args.bp3m_a_chi2_threshold
-            # When galactic coords are active, y_obs is already Galactic-rotated;
-            # precompute per-star rotation matrices to bring BP3M ICRS values into
-            # the same frame before chi-squared comparison.
-            if args.galactic_coords and _chi2_thr < np.inf:
-                _ra_gmm_chi2  = gaia_df['ra'].values[keep_inds]
-                _dec_gmm_chi2 = gaia_df['dec'].values[keep_inds]
-                _R_gmm_chi2   = galactic_pm_rotation_matrices(_ra_gmm_chi2, _dec_gmm_chi2)
+                latent_id_to_row = {int(gid): i
+                                    for i, gid in enumerate(latent_gaia_ids)}
             else:
-                _R_gmm_chi2 = None
-            for i_gmm, gid in enumerate(gmm_gaia_ids):
-                bp3m_idx = bp3m_id_to_row.get(int(gid))
-                if bp3m_idx is None:
-                    continue
-                row = bp3m_df.iloc[bp3m_idx]
-                # Chi-squared pre-filter: revert to Gaia-only if BP3M PM is
-                # inconsistent with Gaia PM within Gaia uncertainties.
-                # Uses C_gaia only (not C_bp3m) since C_bp3m depends on C_gaia.
-                # Stars with no valid Gaia PM (zero/non-finite C_gaia diagonal)
-                # always pass (nan chi2 → no rejection).
-                if _chi2_thr < np.inf:
-                    _y_cmp = np.array([float(row['pmra_bp3m']),
-                                       float(row['pmdec_bp3m']),
-                                       float(row['parallax_bp3m'])])
-                    if _R_gmm_chi2 is not None:
-                        _y_cmp[:2] = _R_gmm_chi2[i_gmm] @ _y_cmp[:2]
-                    chi2_i = _bp3m_gaia_chi2(y_obs[i_gmm], _y_cmp, S_obs[i_gmm])
-                    if np.isfinite(chi2_i) and chi2_i > _chi2_thr:
-                        is_hst_main_gmm[i_gmm] = False
-                        n_chi2_rejected += 1
-                        continue
+                latent_id_to_row = {}
+
+            if gaia_source_ids is not None:
+                # Find which GMM stars are in BP3M (Group A mask over keep_inds)
+                gmm_gaia_ids  = gaia_source_ids[keep_inds]
+                hst_a_in_gmm  = np.array([int(gid) in bp3m_id_to_row
+                                           for gid in gmm_gaia_ids], dtype=bool)
+                is_hst_main_gmm = hst_a_in_gmm
+                N_gmm = len(y_obs)
+
+                # In latent mode, allocate padded sensitivity matrix for Group A
                 if _use_latent:
-                    lat_idx = latent_id_to_row.get(int(gid))
-                    if lat_idx is not None:
-                        y_obs[i_gmm] = cond_means_bp3m[lat_idx]
-                        S_obs[i_gmm] = C_vT_pm_bp3m[lat_idx]
-                        S_latent_hst_a_gmm[i_gmm] = S_pm_bp3m[lat_idx]
+                    _N_modes_a = S_pm_bp3m.shape[2]
+                    S_latent_hst_a_gmm = np.zeros((N_gmm, 3, _N_modes_a))
+
+                # Substitute y_obs / S_obs for Group A stars.
+                # Latent (v2): use conditional means + C_vT_pm.
+                # V1:          use marginal means + C_pm (C_obs).
+                n_subst = 0
+                n_chi2_rejected = 0
+                _chi2_thr = args.bp3m_a_chi2_threshold
+                # When galactic coords are active, y_obs is already Galactic-rotated;
+                # precompute per-star rotation matrices to bring BP3M ICRS values into
+                # the same frame before chi-squared comparison.
+                if args.galactic_coords and _chi2_thr < np.inf:
+                    _ra_gmm_chi2  = gaia_df['ra'].values[keep_inds]
+                    _dec_gmm_chi2 = gaia_df['dec'].values[keep_inds]
+                    _R_gmm_chi2   = galactic_pm_rotation_matrices(_ra_gmm_chi2, _dec_gmm_chi2)
+                else:
+                    _R_gmm_chi2 = None
+                for i_gmm, gid in enumerate(gmm_gaia_ids):
+                    bp3m_idx = bp3m_id_to_row.get(int(gid))
+                    if bp3m_idx is None:
+                        continue
+                    row = bp3m_df.iloc[bp3m_idx]
+                    # Chi-squared pre-filter: revert to Gaia-only if BP3M PM is
+                    # inconsistent with Gaia PM within Gaia uncertainties.
+                    # Uses C_gaia only (not C_bp3m) since C_bp3m depends on C_gaia.
+                    # Stars with no valid Gaia PM (zero/non-finite C_gaia diagonal)
+                    # always pass (nan chi2 → no rejection).
+                    if _chi2_thr < np.inf:
+                        _y_cmp = np.array([float(row['pmra_bp3m']),
+                                           float(row['pmdec_bp3m']),
+                                           float(row['parallax_bp3m'])])
+                        if _R_gmm_chi2 is not None:
+                            _y_cmp[:2] = _R_gmm_chi2[i_gmm] @ _y_cmp[:2]
+                        chi2_i = _bp3m_gaia_chi2(y_obs[i_gmm], _y_cmp, S_obs[i_gmm])
+                        if np.isfinite(chi2_i) and chi2_i > _chi2_thr:
+                            is_hst_main_gmm[i_gmm] = False
+                            n_chi2_rejected += 1
+                            continue
+                    if _use_latent:
+                        lat_idx = latent_id_to_row.get(int(gid))
+                        if lat_idx is not None:
+                            y_obs[i_gmm] = cond_means_bp3m[lat_idx]
+                            S_obs[i_gmm] = C_vT_pm_bp3m[lat_idx]
+                            S_latent_hst_a_gmm[i_gmm] = S_pm_bp3m[lat_idx]
+                        else:
+                            # Fallback to v1 for this star if not in latent set
+                            y_obs[i_gmm] = [float(row['pmra_bp3m']),
+                                             float(row['pmdec_bp3m']),
+                                             float(row['parallax_bp3m'])]
+                            S_obs[i_gmm] = C_pm_bp3m[bp3m_idx]
                     else:
-                        # Fallback to v1 for this star if not in latent set
                         y_obs[i_gmm] = [float(row['pmra_bp3m']),
                                          float(row['pmdec_bp3m']),
                                          float(row['parallax_bp3m'])]
                         S_obs[i_gmm] = C_pm_bp3m[bp3m_idx]
+                    n_subst += 1
+                _mode_label = 'latent v2' if _use_latent else 'v1'
+                _chi2_msg = (f'; {n_chi2_rejected:,} reverted to Gaia (chi2>{_chi2_thr})'
+                             if n_chi2_rejected > 0 else '')
+                print(f'  Group A: substituted BP3M obs for {n_subst:,} stars '
+                      f'in GMM dataset ({_mode_label}){_chi2_msg}')
+
+                # Rotate Group A BP3M values to Galactic frame if needed.
+                if args.galactic_coords and np.any(is_hst_main_gmm):
+                    _a_inds = np.where(is_hst_main_gmm)[0]
+                    _ra_a   = gaia_df['ra'].values[keep_inds][_a_inds]
+                    _dec_a  = gaia_df['dec'].values[keep_inds][_a_inds]
+                    R_a     = galactic_pm_rotation_matrices(_ra_a, _dec_a)
+                    y_obs[_a_inds, :2] = np.einsum('nij,nj->ni', R_a, y_obs[_a_inds, :2])
+                    _S3  = S_obs[_a_inds].copy()
+                    _pm  = _S3[:, :2, :2].copy()
+                    _crx = _S3[:, :2,  2].copy()
+                    _S3[:, :2, :2] = np.einsum('nij,njk,nlk->nil', R_a, _pm, R_a)
+                    _S3[:, :2,  2] = np.einsum('nij,nj->ni',       R_a, _crx)
+                    _S3[:,  2, :2] = _S3[:, :2, 2]
+                    S_obs[_a_inds] = _S3
+                    # Rotate latent sensitivity matrices for Group A (ICRS → Galactic)
+                    if _use_latent and S_latent_hst_a_gmm is not None:
+                        # R_a: (n_a, 2, 2); S[:, :2, :] rotated as R_a @ S[:, :2, :]
+                        _Sa = S_latent_hst_a_gmm[_a_inds].copy()
+                        _Sa[:, :2, :] = np.einsum('nij,njk->nik', R_a, _Sa[:, :2, :])
+                        S_latent_hst_a_gmm[_a_inds] = _Sa
+
+                # Group B: BP3M stars NOT in the Gaia PM catalog
+                gaia_id_set = set(int(g) for g in gaia_source_ids)
+            else:
+                is_hst_main_gmm = None
+                gaia_id_set     = set()
+                print('  WARNING: source_id not in gaia_df; BP3M Group A substitution skipped '
+                      '(use --redownload to refresh the Gaia cache)')
+
+            # Build Group B from BP3M stars absent from gaia_df
+            bp3m_in_gaia = np.array([int(gid) in gaia_id_set
+                                      for gid in bp3m_df['Gaia_id'].values], dtype=bool)
+            bp3m_b_df_gmm = bp3m_df[~bp3m_in_gaia].reset_index(drop=True)
+            C_pm_b         = C_pm_bp3m[~bp3m_in_gaia]
+            N_B = len(bp3m_b_df_gmm)
+
+            if N_B > 0:
+                b_ra  = bp3m_b_df_gmm['ra'].to_numpy(dtype=float)
+                b_dec = bp3m_b_df_gmm['dec'].to_numpy(dtype=float)
+                _cos  = np.cos(np.deg2rad(radec_center[1]))
+                b_dx  = ((b_ra - radec_center[0] + 180.0) % 360.0 - 180.0) * _cos
+                b_dy  = b_dec - radec_center[1]
+
+                # Latent mode (v2): use conditional means + C_vT_pm for Group B.
+                # Group B stars are a subset of bp3m_df (same filter as latent_data),
+                # so nearly all will be in latent_id_to_row; fall back per-star if not.
+                if _use_latent:
+                    _N_modes_b = S_pm_bp3m.shape[2]
+                    y_obs_hst_b_gmm = np.zeros((N_B, 3))
+                    S_obs_hst_b_gmm = np.zeros((N_B, 3, 3))
+                    S_latent_hst_b_gmm = np.zeros((N_B, 3, _N_modes_b))
+                    for _ib, _gid in enumerate(bp3m_b_df_gmm['Gaia_id'].values):
+                        _lr = latent_id_to_row.get(int(_gid), -1)
+                        if _lr >= 0:
+                            y_obs_hst_b_gmm[_ib] = cond_means_bp3m[_lr]
+                            S_obs_hst_b_gmm[_ib] = C_vT_pm_bp3m[_lr]
+                            S_latent_hst_b_gmm[_ib] = S_pm_bp3m[_lr]
+                        else:
+                            _brow = bp3m_id_to_row.get(int(_gid))
+                            y_obs_hst_b_gmm[_ib] = [
+                                float(bp3m_df.iloc[_brow]['pmra_bp3m']),
+                                float(bp3m_df.iloc[_brow]['pmdec_bp3m']),
+                                float(bp3m_df.iloc[_brow]['parallax_bp3m'])]
+                            S_obs_hst_b_gmm[_ib] = C_pm_bp3m[_brow]
                 else:
-                    y_obs[i_gmm] = [float(row['pmra_bp3m']),
-                                     float(row['pmdec_bp3m']),
-                                     float(row['parallax_bp3m'])]
-                    S_obs[i_gmm] = C_pm_bp3m[bp3m_idx]
-                n_subst += 1
-            _mode_label = 'latent v2' if _use_latent else 'v1'
-            _chi2_msg = (f'; {n_chi2_rejected:,} reverted to Gaia (chi2>{_chi2_thr})'
-                         if n_chi2_rejected > 0 else '')
-            print(f'  Group A: substituted BP3M obs for {n_subst:,} stars '
-                  f'in GMM dataset ({_mode_label}){_chi2_msg}')
+                    y_obs_hst_b_gmm = np.column_stack([
+                        bp3m_b_df_gmm['pmra_bp3m'].to_numpy(dtype=float),
+                        bp3m_b_df_gmm['pmdec_bp3m'].to_numpy(dtype=float),
+                        bp3m_b_df_gmm['parallax_bp3m'].to_numpy(dtype=float),
+                    ])
+                    S_obs_hst_b_gmm = C_pm_b.copy()
 
-            # Rotate Group A BP3M values to Galactic frame if needed.
-            if args.galactic_coords and np.any(is_hst_main_gmm):
-                _a_inds = np.where(is_hst_main_gmm)[0]
-                _ra_a   = gaia_df['ra'].values[keep_inds][_a_inds]
-                _dec_a  = gaia_df['dec'].values[keep_inds][_a_inds]
-                R_a     = galactic_pm_rotation_matrices(_ra_a, _dec_a)
-                y_obs[_a_inds, :2] = np.einsum('nij,nj->ni', R_a, y_obs[_a_inds, :2])
-                _S3  = S_obs[_a_inds].copy()
-                _pm  = _S3[:, :2, :2].copy()
-                _crx = _S3[:, :2,  2].copy()
-                _S3[:, :2, :2] = np.einsum('nij,njk,nlk->nil', R_a, _pm, R_a)
-                _S3[:, :2,  2] = np.einsum('nij,nj->ni',       R_a, _crx)
-                _S3[:,  2, :2] = _S3[:, :2, 2]
-                S_obs[_a_inds] = _S3
-                # Rotate latent sensitivity matrices for Group A (ICRS → Galactic)
-                if _use_latent and S_latent_hst_a_gmm is not None:
-                    # R_a: (n_a, 2, 2); S[:, :2, :] rotated as R_a @ S[:, :2, :]
-                    _Sa = S_latent_hst_a_gmm[_a_inds].copy()
-                    _Sa[:, :2, :] = np.einsum('nij,njk->nik', R_a, _Sa[:, :2, :])
-                    S_latent_hst_a_gmm[_a_inds] = _Sa
+                hst_b_pos_gmm   = np.column_stack([b_dx, b_dy])
 
-            # Group B: BP3M stars NOT in the Gaia PM catalog
-            gaia_id_set = set(int(g) for g in gaia_source_ids)
-        else:
-            is_hst_main_gmm = None
-            gaia_id_set     = set()
-            print('  WARNING: source_id not in gaia_df; BP3M Group A substitution skipped '
-                  '(use --redownload to refresh the Gaia cache)')
+                # Rotate Group B BP3M values to Galactic frame if needed.
+                if args.galactic_coords:
+                    R_b = galactic_pm_rotation_matrices(b_ra, b_dec)
+                    y_obs_hst_b_gmm[:, :2] = np.einsum('nij,nj->ni', R_b, y_obs_hst_b_gmm[:, :2])
+                    _pm  = S_obs_hst_b_gmm[:, :2, :2].copy()
+                    _crx = S_obs_hst_b_gmm[:, :2,  2].copy()
+                    S_obs_hst_b_gmm[:, :2, :2] = np.einsum('nij,njk,nlk->nil', R_b, _pm, R_b)
+                    S_obs_hst_b_gmm[:, :2,  2] = np.einsum('nij,nj->ni',       R_b, _crx)
+                    S_obs_hst_b_gmm[:,  2, :2] = S_obs_hst_b_gmm[:, :2, 2]
+                    # Rotate latent sensitivity matrices for Group B
+                    if _use_latent and S_latent_hst_b_gmm is not None:
+                        S_latent_hst_b_gmm[:, :2, :] = np.einsum(
+                            'nij,njk->nik', R_b, S_latent_hst_b_gmm[:, :2, :])
 
-        # Build Group B from BP3M stars absent from gaia_df
-        bp3m_in_gaia = np.array([int(gid) in gaia_id_set
-                                  for gid in bp3m_df['Gaia_id'].values], dtype=bool)
-        bp3m_b_df_gmm = bp3m_df[~bp3m_in_gaia].reset_index(drop=True)
-        C_pm_b         = C_pm_bp3m[~bp3m_in_gaia]
-        N_B = len(bp3m_b_df_gmm)
-
-        if N_B > 0:
-            b_ra  = bp3m_b_df_gmm['ra'].to_numpy(dtype=float)
-            b_dec = bp3m_b_df_gmm['dec'].to_numpy(dtype=float)
-            _cos  = np.cos(np.deg2rad(radec_center[1]))
-            b_dx  = ((b_ra - radec_center[0] + 180.0) % 360.0 - 180.0) * _cos
-            b_dy  = b_dec - radec_center[1]
-
-            # Latent mode (v2): use conditional means + C_vT_pm for Group B.
-            # Group B stars are a subset of bp3m_df (same filter as latent_data),
-            # so nearly all will be in latent_id_to_row; fall back per-star if not.
-            if _use_latent:
-                _N_modes_b = S_pm_bp3m.shape[2]
-                y_obs_hst_b_gmm = np.zeros((N_B, 3))
-                S_obs_hst_b_gmm = np.zeros((N_B, 3, 3))
-                S_latent_hst_b_gmm = np.zeros((N_B, 3, _N_modes_b))
-                for _ib, _gid in enumerate(bp3m_b_df_gmm['Gaia_id'].values):
-                    _lr = latent_id_to_row.get(int(_gid), -1)
-                    if _lr >= 0:
-                        y_obs_hst_b_gmm[_ib] = cond_means_bp3m[_lr]
-                        S_obs_hst_b_gmm[_ib] = C_vT_pm_bp3m[_lr]
-                        S_latent_hst_b_gmm[_ib] = S_pm_bp3m[_lr]
-                    else:
-                        _brow = bp3m_id_to_row.get(int(_gid))
-                        y_obs_hst_b_gmm[_ib] = [
-                            float(bp3m_df.iloc[_brow]['pmra_bp3m']),
-                            float(bp3m_df.iloc[_brow]['pmdec_bp3m']),
-                            float(bp3m_df.iloc[_brow]['parallax_bp3m'])]
-                        S_obs_hst_b_gmm[_ib] = C_pm_bp3m[_brow]
-            else:
-                y_obs_hst_b_gmm = np.column_stack([
-                    bp3m_b_df_gmm['pmra_bp3m'].to_numpy(dtype=float),
-                    bp3m_b_df_gmm['pmdec_bp3m'].to_numpy(dtype=float),
-                    bp3m_b_df_gmm['parallax_bp3m'].to_numpy(dtype=float),
-                ])
-                S_obs_hst_b_gmm = C_pm_b.copy()
-
-            hst_b_pos_gmm   = np.column_stack([b_dx, b_dy])
-
-            # Rotate Group B BP3M values to Galactic frame if needed.
-            if args.galactic_coords:
-                R_b = galactic_pm_rotation_matrices(b_ra, b_dec)
-                y_obs_hst_b_gmm[:, :2] = np.einsum('nij,nj->ni', R_b, y_obs_hst_b_gmm[:, :2])
-                _pm  = S_obs_hst_b_gmm[:, :2, :2].copy()
-                _crx = S_obs_hst_b_gmm[:, :2,  2].copy()
-                S_obs_hst_b_gmm[:, :2, :2] = np.einsum('nij,njk,nlk->nil', R_b, _pm, R_b)
-                S_obs_hst_b_gmm[:, :2,  2] = np.einsum('nij,nj->ni',       R_b, _crx)
-                S_obs_hst_b_gmm[:,  2, :2] = S_obs_hst_b_gmm[:, :2, 2]
-                # Rotate latent sensitivity matrices for Group B
-                if _use_latent and S_latent_hst_b_gmm is not None:
-                    S_latent_hst_b_gmm[:, :2, :] = np.einsum(
-                        'nij,njk->nik', R_b, S_latent_hst_b_gmm[:, :2, :])
-
-            # Fixed log spatial density from step-5 posterior medians
-            b_offsets  = np.column_stack([b_dx, b_dy])
-            a_deg_sp   = float(sp['new_a_plummer']) / 60.0
-            q_sp       = 1.0 - float(sp['new_ellipticity'])
-            r_ell_b    = compute_elliptical_r(
-                b_offsets,
-                sp['new_delta_ra_center'], sp['new_delta_dec_center'],
-                sp['new_pa_deg'], sp['new_ellipticity'],
-                scale_deg=priors['rhalf_mean'] / 60.0,
-            )
-            if args.spatial_profile == 'sersic':
-                log_spatial_b_gmm = (- np.log(2 * np.pi)
-                                      - 2 * np.log(a_deg_sp)
-                                      - np.log(q_sp)
-                                      - r_ell_b / a_deg_sp)
-            else:
-                log_spatial_b_gmm = (np.log(1.0 / (np.pi * a_deg_sp**2 * q_sp))
-                                      - 2.0 * np.log(1.0 + r_ell_b**2 / a_deg_sp**2))
-
-            # Photometric prior for Group B via the same KDE/profile used for
-            # Gaia stars.  Concatenate Group B magnitudes with the Gaia arrays
-            # so the training-set masks align; Group B rows are excluded from
-            # training (all-False extension) and evaluated as query points only.
-            # The KDE naturally becomes uninformative past G~20.7 where training
-            # data thins out, so no special casing is needed.
-            _b_gmags  = bp3m_b_df_gmm[['gmag',  'gmag_error' ]].to_numpy(dtype=float)
-            _b_bpmags = bp3m_b_df_gmm[['bpmag', 'bpmag_error']].to_numpy(dtype=float)
-            _b_rpmags = bp3m_b_df_gmm[['rpmag', 'rpmag_error']].to_numpy(dtype=float)
-            _N_gaia   = len(kin['gmags'])
-            _gcat  = np.vstack([kin['gmags'],  _b_gmags])
-            _bpcat = np.vstack([kin['bpmags'], _b_bpmags])
-            _rpcat = np.vstack([kin['rpmags'], _b_rpmags])
-            _mcat  = np.concatenate([clean_sample,     np.zeros(N_B, dtype=bool)])
-            _bgcat = np.concatenate([clean_background, np.zeros(N_B, dtype=bool)])
-            if not args.binned_prior:
-                _plp_cat = compute_photometric_prior_kde(
-                    _gcat, _rpcat, _bpcat, _mcat, _bgcat, priors['gmag_limit'],
+                # Fixed log spatial density from step-5 posterior medians
+                b_offsets  = np.column_stack([b_dx, b_dy])
+                a_deg_sp   = float(sp['new_a_plummer']) / 60.0
+                q_sp       = 1.0 - float(sp['new_ellipticity'])
+                r_ell_b    = compute_elliptical_r(
+                    b_offsets,
+                    sp['new_delta_ra_center'], sp['new_delta_dec_center'],
+                    sp['new_pa_deg'], sp['new_ellipticity'],
+                    scale_deg=priors['rhalf_mean'] / 60.0,
                 )
-            else:
-                _plp_cat, _ = compute_photometric_prior(
-                    _gcat, _rpcat, _bpcat, _mcat, _bgcat, priors['gmag_limit'],
+                if args.spatial_profile == 'sersic':
+                    log_spatial_b_gmm = (- np.log(2 * np.pi)
+                                          - 2 * np.log(a_deg_sp)
+                                          - np.log(q_sp)
+                                          - r_ell_b / a_deg_sp)
+                else:
+                    log_spatial_b_gmm = (np.log(1.0 / (np.pi * a_deg_sp**2 * q_sp))
+                                          - 2.0 * np.log(1.0 + r_ell_b**2 / a_deg_sp**2))
+
+                # Photometric prior for Group B via the same KDE/profile used for
+                # Gaia stars.  Concatenate Group B magnitudes with the Gaia arrays
+                # so the training-set masks align; Group B rows are excluded from
+                # training (all-False extension) and evaluated as query points only.
+                # The KDE naturally becomes uninformative past G~20.7 where training
+                # data thins out, so no special casing is needed.
+                _b_gmags  = bp3m_b_df_gmm[['gmag',  'gmag_error' ]].to_numpy(dtype=float)
+                _b_bpmags = bp3m_b_df_gmm[['bpmag', 'bpmag_error']].to_numpy(dtype=float)
+                _b_rpmags = bp3m_b_df_gmm[['rpmag', 'rpmag_error']].to_numpy(dtype=float)
+                _N_gaia   = len(kin['gmags'])
+                _gcat  = np.vstack([kin['gmags'],  _b_gmags])
+                _bpcat = np.vstack([kin['bpmags'], _b_bpmags])
+                _rpcat = np.vstack([kin['rpmags'], _b_rpmags])
+                _mcat  = np.concatenate([clean_sample,     np.zeros(N_B, dtype=bool)])
+                _bgcat = np.concatenate([clean_background, np.zeros(N_B, dtype=bool)])
+                if not args.binned_prior:
+                    _plp_cat = compute_photometric_prior_kde(
+                        _gcat, _rpcat, _bpcat, _mcat, _bgcat, priors['gmag_limit'],
+                    )
+                else:
+                    _plp_cat, _ = compute_photometric_prior(
+                        _gcat, _rpcat, _bpcat, _mcat, _bgcat, priors['gmag_limit'],
+                    )
+                _prior_log_probs_b = _plp_cat[_N_gaia:]
+                log_prior_ws_b_gmm = build_log_prior_weights(
+                    _prior_log_probs_b, np.ones(N_B, dtype=bool), np.arange(N_B),
+                    bad_rhalf, np.zeros(N_B, dtype=bool), N_CLUSTERS,
                 )
-            _prior_log_probs_b = _plp_cat[_N_gaia:]
-            log_prior_ws_b_gmm = build_log_prior_weights(
-                _prior_log_probs_b, np.ones(N_B, dtype=bool), np.arange(N_B),
-                bad_rhalf, np.zeros(N_B, dtype=bool), N_CLUSTERS,
-            )
-            hst_b_prior_probs_gmm = np.exp(log_prior_ws_b_gmm[:, 0])
-            print(f'  Group B photometric prior: median P(member|CMD) = '
-                  f'{float(np.median(hst_b_prior_probs_gmm)):.3f}')
+                hst_b_prior_probs_gmm = np.exp(log_prior_ws_b_gmm[:, 0])
+                print(f'  Group B photometric prior: median P(member|CMD) = '
+                      f'{float(np.median(hst_b_prior_probs_gmm)):.3f}')
 
-            # HST footprint area: bounding box of all BP3M star offsets
-            all_dx = ((bp3m_df['ra'].to_numpy(dtype=float) - radec_center[0] + 180.0)
-                      % 360.0 - 180.0) * _cos
-            all_dy = bp3m_df['dec'].to_numpy(dtype=float) - radec_center[1]
-            hst_area_gmm = float(np.ptp(all_dx) * np.ptp(all_dy))
-            if hst_area_gmm <= 0:
-                hst_area_gmm = float(gmm_survey_area)  # fallback
-            print(f'  Group B: {N_B:,} BP3M-only stars; '
-                  f'HST footprint ≈ {hst_area_gmm:.4f} deg²')
+                # HST footprint area: bounding box of all BP3M star offsets
+                all_dx = ((bp3m_df['ra'].to_numpy(dtype=float) - radec_center[0] + 180.0)
+                          % 360.0 - 180.0) * _cos
+                all_dy = bp3m_df['dec'].to_numpy(dtype=float) - radec_center[1]
+                hst_area_gmm = float(np.ptp(all_dx) * np.ptp(all_dy))
+                if hst_area_gmm <= 0:
+                    hst_area_gmm = float(gmm_survey_area)  # fallback
+                print(f'  Group B: {N_B:,} BP3M-only stars; '
+                      f'HST footprint ≈ {hst_area_gmm:.4f} deg²')
+            else:
+                print('  Group B: no BP3M-only stars (all BP3M stars have Gaia PMs)')
+
+        # Survey area for the GMM = area of the elliptical selection region.
+        # r_ell_updated was normalised by priors['rhalf_mean']/60 deg, so the
+        # selection ellipse has semi-major axis = GMM_MAX_R_ELL * rhalf_deg and
+        # semi-minor axis = GMM_MAX_R_ELL * rhalf_deg * q.
+        # For bad_rhalf the spatial cutoff was not applied, so use the full field.
+        if bad_rhalf:
+            gmm_survey_area = kin['survey_area']
         else:
-            print('  Group B: no BP3M-only stars (all BP3M stars have Gaia PMs)')
+            _rhalf_deg      = priors['rhalf_mean'] / 60.0
+            _q_gmm          = 1.0 - sp['new_ellipticity']
+            gmm_survey_area = np.pi * (GMM_MAX_R_ELL * _rhalf_deg)**2 * _q_gmm
+        print(f'  GMM survey area: {gmm_survey_area:.5f} deg²  '
+              f'(full field: {kin["survey_area"]:.4f} deg²)')
 
-    # Survey area for the GMM = area of the elliptical selection region.
-    # r_ell_updated was normalised by priors['rhalf_mean']/60 deg, so the
-    # selection ellipse has semi-major axis = GMM_MAX_R_ELL * rhalf_deg and
-    # semi-minor axis = GMM_MAX_R_ELL * rhalf_deg * q.
-    # For bad_rhalf the spatial cutoff was not applied, so use the full field.
-    if bad_rhalf:
-        gmm_survey_area = kin['survey_area']
-    else:
-        _rhalf_deg      = priors['rhalf_mean'] / 60.0
-        _q_gmm          = 1.0 - sp['new_ellipticity']
-        gmm_survey_area = np.pi * (GMM_MAX_R_ELL * _rhalf_deg)**2 * _q_gmm
-    print(f'  GMM survey area: {gmm_survey_area:.5f} deg²  '
-          f'(full field: {kin["survey_area"]:.4f} deg²)')
+        # Estimate the field-level membership fraction from the background surface
+        # density measured in the outer annulus (r_ell >= threshold).
+        # annulus_area ≈ full_field − selection_ellipse; floored so it stays positive.
+        _annulus_area   = max(kin['survey_area'] - gmm_survey_area, gmm_survey_area * 0.01)
+        _bg_density     = good_backgrounds.sum() / _annulus_area          # stars / deg²
+        _n_bg_expected  = _bg_density * gmm_survey_area
+        f_dwarf_prior   = float(np.clip(
+            1.0 - _n_bg_expected / max(len(y_obs), 1), 0.001, 0.999))
+        print(f'  f_dwarf prior:   {f_dwarf_prior:.4f}  '
+              f'(~{f_dwarf_prior * len(y_obs):.0f} / {len(y_obs):,} stars expected as members)')
 
-    # Estimate the field-level membership fraction from the background surface
-    # density measured in the outer annulus (r_ell >= threshold).
-    # annulus_area ≈ full_field − selection_ellipse; floored so it stays positive.
-    _annulus_area   = max(kin['survey_area'] - gmm_survey_area, gmm_survey_area * 0.01)
-    _bg_density     = good_backgrounds.sum() / _annulus_area          # stars / deg²
-    _n_bg_expected  = _bg_density * gmm_survey_area
-    f_dwarf_prior   = float(np.clip(
-        1.0 - _n_bg_expected / max(len(y_obs), 1), 0.001, 0.999))
-    print(f'  f_dwarf prior:   {f_dwarf_prior:.4f}  '
-          f'(~{f_dwarf_prior * len(y_obs):.0f} / {len(y_obs):,} stars expected as members)')
+        # Per-source QSO prior for the GMM stars (3-class model).
+        log_prior_qso_gmm = None
+        f_qso_prior_gmm   = None
+        log_qso_photo_all = None
+        if args.qso_correction and bpmags_qso_clean is not None:
+            log_qso_photo_all = compute_qso_photometric_prior(
+                kin['gmags'], kin['rpmags'], kin['bpmags'],
+                gmags_qso, rpmags_qso_clean, bpmags_qso_clean,
+                qso_gmag_errs=gmag_errs_qso,
+                qso_bpmag_errs=bpmag_errs_qso,
+                qso_rpmag_errs=rpmag_errs_qso,
+            )
+            log_prior_qso_gmm = (log_qso_photo_all + log_prior_qso_src)[keep_inds]
 
-    # Per-source QSO prior for the GMM stars (3-class model).
-    log_prior_qso_gmm = None
-    f_qso_prior_gmm   = None
-    log_qso_photo_all = None
-    if args.qso_correction and bpmags_qso_clean is not None:
-        log_qso_photo_all = compute_qso_photometric_prior(
-            kin['gmags'], kin['rpmags'], kin['bpmags'],
-            gmags_qso, rpmags_qso_clean, bpmags_qso_clean,
-            qso_gmag_errs=gmag_errs_qso,
-            qso_bpmag_errs=bpmag_errs_qso,
-            qso_rpmag_errs=rpmag_errs_qso,
+            qso_surf_dens   = compute_qso_surface_density(len(qso_clean_df),
+                                                           n_gaia_raw, args.qso_radius)
+            n_qso_expected  = qso_surf_dens * gmm_survey_area
+            f_qso_prior_gmm = float(np.clip(n_qso_expected / max(len(y_obs), 1), 0.001, 0.5))
+            print(f'  QSO surface density: {qso_surf_dens:.2f} /deg²  →  '
+                  f'f_qso prior = {f_qso_prior_gmm:.4f}')
+
+        # QSO candidates in main catalog and wide-field photometry for plot overlay.
+        _qso_pos    = kin['radec_offsets'][is_qso_main] if is_qso_main.any() else None
+        _qso_pms    = kin['pms'][is_qso_main]           if is_qso_main.any() else None
+        _qso_priors = (np.exp(log_prior_qso_src[is_qso_main])
+                       if is_qso_main.any() else None)
+        _qso_cmd_c  = ((bpmags_qso_clean - rpmags_qso_clean)
+                       if bpmags_qso_clean is not None and rpmags_qso_clean is not None
+                       else None)
+
+        # Build Group-B overlay dict for population summary figures.
+        # y_obs_hst_b_gmm already contains BP3M PMs (Galactic-rotated if needed).
+        _hst_b_data = None
+        if hst_b_pos_gmm is not None and bp3m_b_df_gmm is not None:
+            _hst_b_data = {
+                'pos':    hst_b_pos_gmm,
+                'pms':    y_obs_hst_b_gmm[:, :2],
+                'colors': bp3m_b_df_gmm['bp_rp'].to_numpy(dtype=float),
+                'gmags':  bp3m_b_df_gmm['gmag'].to_numpy(dtype=float),
+                'probs':  hst_b_prior_probs_gmm,   # P(member|CMD) from KDE
+            }
+
+        plot_pre_gmm(
+            pos_obs, y_obs,
+            kin['colors'], kin['gmags'], keep_inds,
+            log_prior_ws, priors['mean_pm'], result_path,
+            pm_labels=pm_labels,
+            qso_pos=_qso_pos, qso_pms=_qso_pms,
+            qso_prior_probs=_qso_priors,
+            qso_cmd_colors=_qso_cmd_c, qso_cmd_gmags=gmags_qso,
+            hst_b_data=_hst_b_data,
         )
-        log_prior_qso_gmm = (log_qso_photo_all + log_prior_qso_src)[keep_inds]
 
-        qso_surf_dens   = compute_qso_surface_density(len(qso_clean_df),
-                                                       n_gaia_raw, args.qso_radius)
-        n_qso_expected  = qso_surf_dens * gmm_survey_area
-        f_qso_prior_gmm = float(np.clip(n_qso_expected / max(len(y_obs), 1), 0.001, 0.5))
-        print(f'  QSO surface density: {qso_surf_dens:.2f} /deg²  →  '
-              f'f_qso prior = {f_qso_prior_gmm:.4f}')
+        if log_qso_photo_all is not None and gmags_qso is not None:
+            plot_qso_cmd_prior_diagnostics(
+                kin['gmags'], kin['rpmags'], kin['bpmags'],
+                log_qso_photo_all, log_prior_qso_src,
+                gmags_qso, rpmags_qso_clean, bpmags_qso_clean,
+                result_path,
+            )
 
-    # QSO candidates in main catalog and wide-field photometry for plot overlay.
-    _qso_pos    = kin['radec_offsets'][is_qso_main] if is_qso_main.any() else None
-    _qso_pms    = kin['pms'][is_qso_main]           if is_qso_main.any() else None
-    _qso_priors = (np.exp(log_prior_qso_src[is_qso_main])
-                   if is_qso_main.any() else None)
-    _qso_cmd_c  = ((bpmags_qso_clean - rpmags_qso_clean)
-                   if bpmags_qso_clean is not None and rpmags_qso_clean is not None
-                   else None)
+        gmags_obs = kin['gmags'][keep_inds, 0]
+        if y_obs_qso is not None:
+            print(f'  Passing {len(y_obs_qso):,} wide-field QSOs to GMM (delta_pm_sys constraint)')
+        if log_prior_qso_gmm is not None:
+            print(f'  3-class GMM: per-source QSO prior enabled')
+        if _use_latent:
+            print(f'  Z-latent mode: {S_pm_bp3m.shape[2]} image-transformation modes')
+        gmm_model = build_gmm_model(
+            pos_obs, y_obs, S_obs, log_prior_ws, gmm_survey_area,
+            priors, sp,
+            bg_means=bg_means, bg_covs=bg_covs, bg_weights=bg_weights,
+            gmags_obs=gmags_obs,
+            spatial_profile=args.spatial_profile,
+            f_dwarf_prior=f_dwarf_prior,
+            y_obs_qso=y_obs_qso, S_obs_qso=S_obs_qso, gmags_qso=gmags_qso,
+            delta_pm_sys_init=delta_pm_sys_init,
+            log_prior_qso=log_prior_qso_gmm, f_qso_prior=f_qso_prior_gmm,
+            log_prior_qso_train=log_prior_qso_train_arr,
+            is_hst_main=is_hst_main_gmm,
+            y_obs_hst_b=y_obs_hst_b_gmm,
+            S_obs_hst_b=S_obs_hst_b_gmm,
+            log_spatial_hst_b=log_spatial_b_gmm,
+            hst_area=hst_area_gmm,
+            log_prior_ws_hst_b=log_prior_ws_b_gmm,
+            hst_pm_sys_init=hst_pm_sys_init,
+            S_latent_hst_a=S_latent_hst_a_gmm,
+            S_latent_hst_b=S_latent_hst_b_gmm,
+        )
+        gmm_trace = run_gmm_model(
+            gmm_model,
+            draws=args.draws, tune=args.tune,
+            chains=args.chains, seed=args.seed,
+        )
 
-    # Build Group-B overlay dict for population summary figures.
-    # y_obs_hst_b_gmm already contains BP3M PMs (Galactic-rotated if needed).
-    _hst_b_data = None
-    if hst_b_pos_gmm is not None and bp3m_b_df_gmm is not None:
-        _hst_b_data = {
-            'pos':    hst_b_pos_gmm,
-            'pms':    y_obs_hst_b_gmm[:, :2],
-            'colors': bp3m_b_df_gmm['bp_rp'].to_numpy(dtype=float),
-            'gmags':  bp3m_b_df_gmm['gmag'].to_numpy(dtype=float),
-            'probs':  hst_b_prior_probs_gmm,   # P(member|CMD) from KDE
+        # Compute good_to_keep for plots — needs ~is_qso_main so done here
+        # after all QSO/membership masks are finalised.  Saved in constant_data
+        # so --from-trace can reconstruct it without re-running steps 5–6.
+        good_to_keep = (np.isfinite(kin['pms'][:, 0])
+                        & np.isfinite(prior_log_probs)
+                        & ~is_qso_main)
+
+        # Store observed data and pre-fit background GMM for portability.
+        # Extra arrays allow --from-trace to skip steps 5–7 entirely.
+        _const = {
+            'y_obs':        y_obs,
+            'pos_obs':      pos_obs,
+            'S_obs':        S_obs,
+            'log_prior_ws': log_prior_ws,
+            'gmags_obs':    gmags_obs,
+            'bg_means':     bg_means,
+            'bg_covs':      bg_covs,
+            'bg_weights':   bg_weights,
+            # arrays needed by --from-trace to reconstruct steps 8–9 state
+            'keep_inds':       keep_inds,
+            'gmm_survey_area': np.array([gmm_survey_area]),
+            'is_qso_main':     is_qso_main.astype(np.int8),
+            'good_to_keep':    good_to_keep.astype(np.int8),
         }
-
-    plot_pre_gmm(
-        pos_obs, y_obs,
-        kin['colors'], kin['gmags'], keep_inds,
-        log_prior_ws, priors['mean_pm'], result_path,
-        pm_labels=pm_labels,
-        qso_pos=_qso_pos, qso_pms=_qso_pms,
-        qso_prior_probs=_qso_priors,
-        qso_cmd_colors=_qso_cmd_c, qso_cmd_gmags=gmags_qso,
-        hst_b_data=_hst_b_data,
-    )
-
-    if log_qso_photo_all is not None and gmags_qso is not None:
-        plot_qso_cmd_prior_diagnostics(
-            kin['gmags'], kin['rpmags'], kin['bpmags'],
-            log_qso_photo_all, log_prior_qso_src,
-            gmags_qso, rpmags_qso_clean, bpmags_qso_clean,
-            result_path,
-        )
-
-    gmags_obs = kin['gmags'][keep_inds, 0]
-    if y_obs_qso is not None:
-        print(f'  Passing {len(y_obs_qso):,} wide-field QSOs to GMM (delta_pm_sys constraint)')
-    if log_prior_qso_gmm is not None:
-        print(f'  3-class GMM: per-source QSO prior enabled')
-    if _use_latent:
-        print(f'  Z-latent mode: {S_pm_bp3m.shape[2]} image-transformation modes')
-    gmm_model = build_gmm_model(
-        pos_obs, y_obs, S_obs, log_prior_ws, gmm_survey_area,
-        priors, sp,
-        bg_means=bg_means, bg_covs=bg_covs, bg_weights=bg_weights,
-        gmags_obs=gmags_obs,
-        spatial_profile=args.spatial_profile,
-        f_dwarf_prior=f_dwarf_prior,
-        y_obs_qso=y_obs_qso, S_obs_qso=S_obs_qso, gmags_qso=gmags_qso,
-        delta_pm_sys_init=delta_pm_sys_init,
-        log_prior_qso=log_prior_qso_gmm, f_qso_prior=f_qso_prior_gmm,
-        log_prior_qso_train=log_prior_qso_train_arr,
-        is_hst_main=is_hst_main_gmm,
-        y_obs_hst_b=y_obs_hst_b_gmm,
-        S_obs_hst_b=S_obs_hst_b_gmm,
-        log_spatial_hst_b=log_spatial_b_gmm,
-        hst_area=hst_area_gmm,
-        log_prior_ws_hst_b=log_prior_ws_b_gmm,
-        hst_pm_sys_init=hst_pm_sys_init,
-        S_latent_hst_a=S_latent_hst_a_gmm,
-        S_latent_hst_b=S_latent_hst_b_gmm,
-    )
-    gmm_trace = run_gmm_model(
-        gmm_model,
-        draws=args.draws, tune=args.tune,
-        chains=args.chains, seed=args.seed,
-    )
-
-    # Store observed data and pre-fit background GMM for portability.
-    _const = {
-        'y_obs':        y_obs,
-        'pos_obs':      pos_obs,
-        'S_obs':        S_obs,
-        'log_prior_ws': log_prior_ws,
-        'gmags_obs':    gmags_obs,
-        'bg_means':     bg_means,
-        'bg_covs':      bg_covs,
-        'bg_weights':   bg_weights,
-    }
-    if y_obs_qso is not None:
-        _const['y_obs_qso']  = y_obs_qso
-        _const['S_obs_qso']  = S_obs_qso
-        _const['gmags_qso']  = gmags_qso
-    _const_ds = _arrays_to_dataset(_const)
-    try:
-        gmm_trace.add_groups({'constant_data': _const_ds})
-    except AttributeError:
-        # Newer ArviZ returns xarray.DataTree which uses item assignment
-        gmm_trace['constant_data'] = _const_ds
-
-    trace_path = os.path.join(result_path, f'{field}_trace.nc')
-    _trace_saved = False
-    # Try engines in order of preference; DataTree needs netCDF4 or h5netcdf
-    # for NETCDF4 format (required for multi-group files).
-    for _engine in [None, 'h5netcdf', 'netcdf4']:
+        # QSO arrays (only when --qso-correction)
+        if y_obs_qso is not None:
+            _const['y_obs_qso']           = y_obs_qso
+            _const['S_obs_qso']           = S_obs_qso
+            _const['gmags_qso']           = gmags_qso
+        if log_prior_qso_gmm is not None:
+            _const['log_prior_qso_gmm']   = log_prior_qso_gmm
+        if bpmags_qso_clean is not None:
+            _const['bpmags_qso_clean']    = bpmags_qso_clean
+            _const['rpmags_qso_clean']    = rpmags_qso_clean
+        if _pos_obs_qso_train is not None:
+            _const['pos_obs_qso_train']   = _pos_obs_qso_train
+        if log_prior_qso_train_arr is not None:
+            _const['log_prior_qso_train'] = log_prior_qso_train_arr
+        if is_milliquas_main.any() or is_gaia_only_main.any():
+            _const['is_milliquas_main']   = is_milliquas_main.astype(np.int8)
+            _const['is_gaia_only_main']   = is_gaia_only_main.astype(np.int8)
+        # HST/BP3M arrays (only when --bp3m-dir)
+        if is_hst_main_gmm is not None:
+            _const['is_hst_main_gmm']     = is_hst_main_gmm.astype(np.int8)
+        if y_obs_hst_b_gmm is not None:
+            _const['y_obs_hst_b']         = y_obs_hst_b_gmm
+            _const['S_obs_hst_b']         = S_obs_hst_b_gmm
+            _const['log_spatial_hst_b']   = log_spatial_b_gmm
+            _const['hst_area']            = np.array([hst_area_gmm if hst_area_gmm else 0.0])
+            _const['log_prior_ws_hst_b']  = log_prior_ws_b_gmm
+            # Group B plot arrays (sky offset, PMs, colours, photometry, prior)
+            _const['hst_b_pos']           = hst_b_pos_gmm
+            _const['hst_b_pms']           = y_obs_hst_b_gmm[:, :2]
+            if bp3m_b_df_gmm is not None:
+                _const['hst_b_colors']    = bp3m_b_df_gmm['bp_rp'].to_numpy(dtype=float)
+                _const['hst_b_gmags']     = bp3m_b_df_gmm['gmag'].to_numpy(dtype=float)
+            if hst_b_prior_probs_gmm is not None:
+                _const['hst_b_prior_probs'] = hst_b_prior_probs_gmm
+            # Group B CSV columns
+            if bp3m_b_df_gmm is not None:
+                _const['hst_b_gaia_id']       = bp3m_b_df_gmm['Gaia_id'].to_numpy()
+                _const['hst_b_ra']            = bp3m_b_df_gmm['ra'].to_numpy(dtype=float)
+                _const['hst_b_dec']           = bp3m_b_df_gmm['dec'].to_numpy(dtype=float)
+                _const['hst_b_pmra_bp3m']     = bp3m_b_df_gmm['pmra_bp3m'].to_numpy(dtype=float)
+                _const['hst_b_pmdec_bp3m']    = bp3m_b_df_gmm['pmdec_bp3m'].to_numpy(dtype=float)
+                _const['hst_b_parallax_bp3m'] = bp3m_b_df_gmm['parallax_bp3m'].to_numpy(dtype=float)
+                _const['hst_b_n_hst_used']    = bp3m_b_df_gmm['n_hst_used'].to_numpy(dtype=float)
+        if S_latent_hst_a_gmm is not None:
+            _const['S_latent_hst_a']      = S_latent_hst_a_gmm
+        if S_latent_hst_b_gmm is not None:
+            _const['S_latent_hst_b']      = S_latent_hst_b_gmm
+        _const_ds = _arrays_to_dataset(_const)
         try:
-            _kw = {} if _engine is None else {'engine': _engine}
-            gmm_trace.to_netcdf(trace_path, **_kw)
-            _trace_saved = True
-            break
-        except Exception:
-            pass
-    if not _trace_saved:
-        # Last resort: save as zarr (no external library needed)
-        _zarr_path = trace_path.replace('.nc', '.zarr')
-        try:
-            gmm_trace.to_zarr(_zarr_path)
-            print(f'  WARNING: NetCDF save failed (install h5netcdf or netCDF4). '
-                  f'Trace saved as zarr → {_zarr_path}')
-            trace_path = _zarr_path
-            _trace_saved = True
-        except Exception as e:
-            print(f'  ERROR: could not save trace ({e}). '
-                  f'Install h5netcdf: conda install h5netcdf')
-    if _trace_saved and trace_path.endswith('.nc'):
-        print(f'  Trace saved → {trace_path}')
+            gmm_trace.add_groups({'constant_data': _const_ds})
+        except AttributeError:
+            # Newer ArviZ returns xarray.DataTree which uses item assignment
+            gmm_trace['constant_data'] = _const_ds
 
-    if args.stop_after <= 7:
-        print(f'Stopping after step 7.')
-        return
+        trace_path = os.path.join(result_path, f'{field}_trace.nc')
+        _trace_saved = False
+        # Try engines in order of preference; DataTree needs netCDF4 or h5netcdf
+        # for NETCDF4 format (required for multi-group files).
+        for _engine in [None, 'h5netcdf', 'netcdf4']:
+            try:
+                _kw = {} if _engine is None else {'engine': _engine}
+                gmm_trace.to_netcdf(trace_path, **_kw)
+                _trace_saved = True
+                break
+            except Exception:
+                pass
+        if not _trace_saved:
+            # Last resort: save as zarr (no external library needed)
+            _zarr_path = trace_path.replace('.nc', '.zarr')
+            try:
+                gmm_trace.to_zarr(_zarr_path)
+                print(f'  WARNING: NetCDF save failed (install h5netcdf or netCDF4). '
+                      f'Trace saved as zarr → {_zarr_path}')
+                trace_path = _zarr_path
+                _trace_saved = True
+            except Exception as e:
+                print(f'  ERROR: could not save trace ({e}). '
+                      f'Install h5netcdf: conda install h5netcdf')
+        if _trace_saved and trace_path.endswith('.nc'):
+            print(f'  Trace saved → {trace_path}')
+
+        if args.stop_after <= 7:
+            print(f'Stopping after step 7.')
+            return
+
+
+    except _SkipToStep8:
+        pass
 
     # ── 8. Posterior summary and diagnostic plots ─────────────────────────
     print('\n[8/9] Saving diagnostic plots...')
@@ -1599,18 +1847,9 @@ def main():
 
     # ── 9. Membership probabilities and final plots ───────────────────────
     print('\n[9/9] Computing per-star membership probabilities...')
-    # Compute sky offsets for QSO training sources (needed for spatial prior).
-    _pos_obs_qso_train = None
-    if log_prior_qso_train_arr is not None:
-        _qso_ok = (np.isfinite(qso_clean_df['pmra'].to_numpy(dtype=float)) &
-                   np.isfinite(qso_clean_df['pmdec'].to_numpy(dtype=float)) &
-                   np.isfinite(qso_clean_df['parallax'].to_numpy(dtype=float)))
-        _qra = qso_clean_df.loc[_qso_ok, 'ra'].to_numpy(dtype=float)
-        _qdc = qso_clean_df.loc[_qso_ok, 'dec'].to_numpy(dtype=float)
-        _ra_c = float(priors['radec_center'][0])
-        _dec_c = float(priors['radec_center'][1])
-        _dx = ((_qra - _ra_c + 180) % 360 - 180) * np.cos(np.deg2rad(_dec_c))
-        _pos_obs_qso_train = np.column_stack([_dx, _qdc - _dec_c])
+    # _pos_obs_qso_train was computed early (step-1 QSO block) and saved to
+    # constant_data.  In --from-trace mode it is restored from constant_data.
+    # No recomputation needed here.
 
     mem_result = compute_membership_probs(
         gmm_trace, y_obs, pos_obs, S_obs, log_prior_ws,
@@ -1618,7 +1857,7 @@ def main():
         bg_means=bg_means, bg_covs=bg_covs, bg_weights=bg_weights,
         gmags_obs=gmags_obs,
         log_prior_qso=log_prior_qso_gmm,
-        spatial_profile=args.spatial_profile,
+        spatial_profile=getattr(args, 'spatial_profile', 'sersic'),
         n_samples=args.n_member_samples,
         seed=args.seed,
         y_obs_qso_train=y_obs_qso,
@@ -1661,9 +1900,8 @@ def main():
         n_qso_members = (final_qso_probs > args.membership_threshold).sum()
         print(f'  {n_qso_members:,} sources classified as QSOs at P > {args.membership_threshold}')
 
-    good_to_keep = (np.isfinite(kin['pms'][:, 0])
-                    & np.isfinite(prior_log_probs)
-                    & ~is_qso_main)
+    # good_to_keep was computed in step 7 (normal mode) or loaded from
+    # constant_data (--from-trace).  Either way it is already set correctly.
 
     # For Group A stars: replace Gaia PMs with BP3M PMs in the VPD.
     pms_for_plot = kin['pms'].copy()
@@ -1720,7 +1958,8 @@ def main():
         print(f'  Group B membership → {bp3m_b_path}')
 
     _save_run_outputs(gmm_trace, priors, pm_labels, kin,
-                      clean_sample, clean_background, result_path)
+                      clean_sample, clean_background, result_path,
+                      spatial_profile=getattr(args, 'spatial_profile', 'sersic'))
 
     print(f'\nDone.  All outputs in {result_path}/')
 
