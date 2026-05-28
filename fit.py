@@ -1778,6 +1778,24 @@ def main():
             # Newer ArviZ returns xarray.DataTree which uses item assignment
             gmm_trace['constant_data'] = _const_ds
 
+        # nutpie stores sampler settings as dict attrs which NetCDF cannot serialise.
+        # Convert any dict-valued attrs to JSON strings across all trace groups.
+        import json as _json
+        def _fix_attrs(obj):
+            if hasattr(obj, 'attrs'):
+                for _k, _v in list(obj.attrs.items()):
+                    if isinstance(_v, dict):
+                        obj.attrs[_k] = _json.dumps(_v)
+        if hasattr(gmm_trace, 'groups'):          # InferenceData
+            _fix_attrs(gmm_trace)
+            for _g in gmm_trace.groups():
+                _fix_attrs(getattr(gmm_trace, _g, None))
+        elif hasattr(gmm_trace, 'subtree'):       # xarray DataTree
+            for _node in gmm_trace.subtree:
+                _fix_attrs(_node)
+                if hasattr(_node, 'ds') and _node.ds is not None:
+                    _fix_attrs(_node.ds)
+
         trace_path = os.path.join(result_path, f'{field}_trace.nc')
         _trace_saved = False
         _save_errors = []
