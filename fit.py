@@ -1780,6 +1780,7 @@ def main():
 
         trace_path = os.path.join(result_path, f'{field}_trace.nc')
         _trace_saved = False
+        _save_errors = []
         # Try engines in order of preference; DataTree needs netCDF4 or h5netcdf
         # for NETCDF4 format (required for multi-group files).
         for _engine in [None, 'h5netcdf', 'netcdf4']:
@@ -1788,20 +1789,21 @@ def main():
                 gmm_trace.to_netcdf(trace_path, **_kw)
                 _trace_saved = True
                 break
-            except Exception:
-                pass
+            except Exception as _e:
+                _save_errors.append(f'  engine={_engine!r}: {_e}')
         if not _trace_saved:
-            # Last resort: save as zarr (no external library needed)
+            # Last resort: save as zarr
             _zarr_path = trace_path.replace('.nc', '.zarr')
             try:
                 gmm_trace.to_zarr(_zarr_path)
-                print(f'  WARNING: NetCDF save failed (install h5netcdf or netCDF4). '
-                      f'Trace saved as zarr → {_zarr_path}')
+                print(f'  WARNING: NetCDF save failed. Trace saved as zarr → {_zarr_path}')
                 trace_path = _zarr_path
                 _trace_saved = True
-            except Exception as e:
-                print(f'  ERROR: could not save trace ({e}). '
-                      f'Install h5netcdf: conda install h5netcdf')
+            except Exception as _e:
+                _save_errors.append(f'  zarr: {_e}')
+                print(f'  ERROR: could not save trace. All engines failed:')
+                for _msg in _save_errors:
+                    print(_msg)
         if _trace_saved and trace_path.endswith('.nc'):
             print(f'  Trace saved → {trace_path}')
 
